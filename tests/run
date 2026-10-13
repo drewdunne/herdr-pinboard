@@ -96,14 +96,14 @@ prefix = "ctrl+space"
 [[keys.command]]
 key = "prefix+m"
 type = "plugin_action"
-command = "arkship.ark-note.drawer"
+command = "oldtool.notes.drawer"
 [[keys.command]]
 key = "prefix+shift+m"
 type = "plugin_action"
-command = "arkship.ark-note.whole"'
+command = "oldtool.notes.whole"'
 k=$(keys "$other")
 [[ $k == "|" ]] || fail "keys bound to another plugin's actions were taken without PINBOARD_KEY_ACTIONS: '$k'"
-k=$(keys "$other" 'PINBOARD_KEY_ACTIONS="arkship.ark-note.drawer arkship.ark-note.whole"   # old names')
+k=$(keys "$other" 'PINBOARD_KEY_ACTIONS="oldtool.notes.drawer oldtool.notes.whole"   # old names')
 [[ $k == "Ctrl+Space then m|Ctrl+Space then Shift+M" ]] || fail "PINBOARD_KEY_ACTIONS with another prefix gave '$k'"
 k=$(keys 'onboarding = false')
 [[ $k == "|" ]] || fail "with no keys bound the hints say '$k'"

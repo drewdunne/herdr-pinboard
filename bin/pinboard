@@ -371,12 +371,12 @@ drawer_closed() { # drawer_closed PANE
 }
 
 restore() {
-  rm -f "$skipped"
   : >"$drawers"
   close_leftover_drawers
   : >"$dismissed"
   relabel
   ensure_drawer
+  rm -f "$skipped"   # last, so a restore that's stopped partway is run again
 }
 
 event_field() { jq -r "$1 // empty" <<<"${HERDR_PLUGIN_EVENT_JSON:-{}}" 2>/dev/null || true; }
@@ -539,7 +539,7 @@ pause() {
   fi
   # Wait for work under way in every session, new ones included, and close the drawers in the
   # running ones.
-  local running seen='' d s
+  local running seen='' d s failed=''
   running=" $(herdr_running_sessions | tr '\n' ' ') "
   while :; do
     local more=''
@@ -549,13 +549,15 @@ pause() {
       [[ " $seen " == *" $s "* ]] && continue
       seen="$seen $s" more=1
       if [[ $running == *" $s "* ]]; then
-        bash "$self" --session "$s" _pause-session || echo "pinboard: couldn't close the drawers in herdr session $s" >&2
+        bash "$self" --session "$s" _pause-session || { echo "pinboard: couldn't close the drawers in herdr session $s" >&2; failed=1; }
       else
-        ( exec 9>"$d/lock"; flock -w 30 9 ) || true
+        ( exec 9>"$d/lock"; flock -w 30 9 ) || { echo "pinboard: herdr session $s's notes are still locked" >&2; failed=1; }
       fi
     done
     [[ -n $more ]] || break
   done
+  # Still paused either way; resume undoes it. A failure means the plugin isn't safe to replace.
+  [[ -z $failed ]] || die "paused, but not every session finished; don't replace the plugin yet (pinboard resume undoes the pause)"
   echo "pinboard: paused (drawers closed; they reopen on resume)"
 }
 
@@ -570,11 +572,17 @@ resume() {
   elif [[ $want == true && $now == false ]]; then
     acct plugin enable "$PLUGIN" >/dev/null || die "couldn't switch the plugin on again; it's still paused"
   fi
+  # Each session is put back before the flag goes, so a resume that's stopped partway is finished
+  # by the next one. Then a last relabel, for panes made in between.
+  local running; running=$(herdr_running_sessions)
+  if [[ $want != false ]]; then
+    for s in $running; do
+      bash "$self" --session "$s" _resume-session || echo "pinboard: couldn't put herdr session $s back" >&2
+    done
+  fi
   rm -f "$paused_flag"
   if [[ $want == false ]]; then echo "pinboard: resumed (switched off, as before)"; return 0; fi
-  for s in $(herdr_running_sessions); do
-    bash "$self" --session "$s" _resume-session || echo "pinboard: couldn't relabel herdr session $s" >&2
-  done
+  for s in $running; do bash "$self" --session "$s" refresh >/dev/null 2>&1 || true; done
   echo "pinboard: resumed"
 }
 
@@ -607,7 +615,7 @@ case $cmd in
   resume) resume ;;
   _pause-session) lock; override=1; close_drawers; close_leftover_drawers ;;
   _resume-session)
-    lock
+    lock; override=1
     if [[ -e $skipped ]]; then restore; else prune_drawers; relabel; ensure_drawer; fi ;;
   hook)
     # Focus changes are frequent; with the drawers off they have nothing to do.

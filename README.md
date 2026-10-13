@@ -42,6 +42,7 @@ herdr plugin install drewdunne/herdr-pinboard
 To type `pinboard` anywhere, link the command into a folder on your `PATH`:
 
 ```sh
+mkdir -p ~/.local/bin
 ln -s "$(herdr plugin list --json | jq -r '.result.plugins[] | select(.plugin_id == "drewdunne.pinboard") | .plugin_root')/bin/pinboard" ~/.local/bin/pinboard
 ```
 
@@ -163,7 +164,7 @@ tests/run
 ```
 
 The tests run a throwaway herdr in a scratch folder, with every `HERDR_` variable unset and their
-own config, state and plugin list. They check that no running session is visible before
+own home, config, state and plugin list. They check that no running session is visible before
 registering anything, so they never touch the herdr you're using.
 
 ## License

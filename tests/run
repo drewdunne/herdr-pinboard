@@ -1,7 +1,7 @@
 #!/bin/bash
 # Tests for the pinboard, against a real herdr in a throwaway folder. Plugins are global to the
-# account, so the test gets its own config and plugin list (XDG_CONFIG_HOME and XDG_STATE_HOME in a
-# scratch folder) and every HERDR_ variable is unset: from inside a herdr pane, herdr would
+# account, so the test gets its own home, config and plugin list (HOME, XDG_CONFIG_HOME and
+# XDG_STATE_HOME in a scratch folder) and every HERDR_ variable is unset: from inside a herdr pane, herdr would
 # otherwise follow them to the herdr you're using. It checks that before registering anything,
 # and never touches your own herdr.
 set -euo pipefail
@@ -15,7 +15,7 @@ ID=drewdunne.pinboard
 
 clean=(env)   # every HERDR_ variable unset, and the scratch folders in place of yours
 for v in $(compgen -e | grep '^HERDR_' || true); do clean+=(-u "$v"); done
-clean+=(XDG_CONFIG_HOME="$tmp/cfg" XDG_STATE_HOME="$tmp/state")
+clean+=(-u XDG_CACHE_HOME -u XDG_DATA_HOME HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/cfg" XDG_STATE_HOME="$tmp/state")   # shells in its panes get a scratch home too
 
 cleanup() {
   for s in "$S" "$S2"; do h --session "$s" server stop >/dev/null 2>&1 || true; done
@@ -56,7 +56,7 @@ listed() { grep -c . "$base/$1/drawers" 2>/dev/null || true; }
 enabled() { hs plugin list --json | jq -r --arg id "$ID" '.result.plugins[] | select(.plugin_id == $id) | .enabled'; }
 reregister() { hs plugin unlink "$ID" >/dev/null; hs plugin link "$root" >/dev/null; }   # what installing again does
 
-mkdir -p "$tmp/cfg/herdr"
+mkdir -p "$tmp/cfg/herdr" "$tmp/home"
 # herdr's default prefix (Ctrl+B), with the README's two keys.
 cat >"$tmp/cfg/herdr/config.toml" <<EOF
 onboarding = false

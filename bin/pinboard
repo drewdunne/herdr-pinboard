@@ -50,10 +50,10 @@ else
 fi
 
 # Settings: plain KEY=value lines; a value in quotes may hold spaces, and ~/ is your home folder.
-unset PINBOARD_STATE_DIR PINBOARD_TITLE_SOURCE PINBOARD_KEY_ACTIONS
+unset PINBOARD_STATE_DIR PINBOARD_TITLE_SOURCE PINBOARD_KEY_ACTIONS PINBOARD_VIEWER
 if [[ -r $config_dir/pinboard.env ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
-    [[ $line =~ ^[[:space:]]*(PINBOARD_STATE_DIR|PINBOARD_TITLE_SOURCE|PINBOARD_KEY_ACTIONS)=(.*)$ ]] || continue
+    [[ $line =~ ^[[:space:]]*(PINBOARD_STATE_DIR|PINBOARD_TITLE_SOURCE|PINBOARD_KEY_ACTIONS|PINBOARD_VIEWER)=(.*)$ ]] || continue
     k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
     if [[ $v =~ ^\"([^\"]*)\" || $v =~ ^\'([^\']*)\' ]]; then v=${BASH_REMATCH[1]}; else v=${v%%[[:space:]]*}; fi
     # shellcheck disable=SC2088  # a literal ~/ in the file
@@ -402,7 +402,7 @@ hook() {
     tab.focused:*|workspace.focused:*) ensure_drawer ;;
     workspace.closed:*)
       local w; w=$(event_field '.data.workspace.workspace_id // .data.workspace_id')
-      [[ -n $w ]] && rm -f "$state/$w.line" "$state/$w.full" "$state/$w.blocker" ;;
+      [[ -n $w ]] && rm -f "$state/$w.line" "$state/$w.full" "$state/$w.blocker" "$state/$w.view.md" ;;
     *:drawer) drawer toggle ;;
     *:whole) whole ;;
     *:restore) restore ;;
@@ -444,8 +444,20 @@ view() { # view drawer|whole
   ws=${HERDR_WORKSPACE_ID:-}
   [[ -n $ws ]] || ws=$(jq -r '.workspace_id // empty' <<<"${HERDR_PLUGIN_CONTEXT_JSON:-{}}" 2>/dev/null || true)
   if [[ $1 == whole ]]; then
-    # The whole note scrolls in less (arrows, space, b); q closes it.
     f=$(note_file "$ws")
+    # A viewer of your own (PINBOARD_VIEWER, say mdroll) gets the note as a file: the blocker
+    # first, unless the note already says it, then the note as written.
+    local viewer=()
+    read -ra viewer <<<"${PINBOARD_VIEWER:-}"
+    if (( ${#viewer[@]} )) && command -v "${viewer[0]}" >/dev/null; then
+      local md=$state/$ws.view.md b=''
+      [[ -s $state/$ws.blocker ]] && b=$(<"$state/$ws.blocker")
+      { if [[ -n $b ]] && ! grep -qF -- "$b" "$f" 2>/dev/null; then printf '**BLOCKER:** %s\n\n' "$b"; fi
+        cat "$f" 2>/dev/null || true; } >"$md"
+      "${viewer[@]}" "$md" || true
+      return 0
+    fi
+    # Otherwise it scrolls in less (arrows, space, b); q closes it.
     { echo; pinboard_text "$ws" "$f" | wrap_note "$(stty size 2>/dev/null | cut -d' ' -f2 || echo 80)"; } |
       less -R -P "q closes · space scrolls" || true
     return 0
@@ -608,7 +620,7 @@ case $cmd in
   clear)
     lock
     [[ ${1:-} == --workspace ]] && ws=${2:?} || ws=$(this_workspace)
-    rm -f "$state/$ws.line" "$state/$ws.full" "$state/$ws.blocker"; relabel "$ws" ;;
+    rm -f "$state/$ws.line" "$state/$ws.full" "$state/$ws.blocker" "$state/$ws.view.md"; relabel "$ws" ;;
   show)
     [[ ${1:-} == --workspace ]] && ws=${2:?} || ws=$(this_workspace)
     [[ -s $state/$ws.line ]] || { echo "workspace $ws has no pinboard"; exit 0; }

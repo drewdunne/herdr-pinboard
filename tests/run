@@ -173,6 +173,30 @@ r=$(chk HERDR_ENV=1 HERDR_WORKSPACE_ID=w999 "$root/bin/pinboard" check --hint "S
 [[ -z $(chk "$root/bin/pinboard" check) ]] || fail "check spoke outside herdr"
 echo "ok    check reminds an agent only where its workspace has no pinboard, with --hint added"
 
+# The whole note in a viewer of your own (PINBOARD_VIEWER): given the note as a file, with its
+# options, the blocker first unless the note already says it; less when the viewer isn't there.
+vcfg=$(mktemp -d "$tmp/v.XXXX"); mkdir -p "$vcfg/herdr/plugins/config/$ID"
+printf '#!/bin/bash\necho "$1" >%q; cat "$2" >%q\n' "$tmp/viewer.args" "$tmp/viewed" >"$tmp/viewer"; chmod +x "$tmp/viewer"
+viewwhole() { # viewwhole VIEWER: what the whole-note pane shows, run as herdr runs it
+  printf 'PINBOARD_VIEWER="%s"\n' "$1" >"$vcfg/herdr/plugins/config/$ID/pinboard.env"
+  chk XDG_CONFIG_HOME="$vcfg" HERDR_WORKSPACE_ID="$w1" "$root/bin/pinboard" view whole </dev/null
+}
+printf '# 0069 Pinned notes\n\nThe note in Markdown.\n' >"$tmp/full"
+note set --workspace "$w1" --full-file "$tmp/full" "0069 · Short line" >/dev/null
+note block --workspace "$w1" "waiting on the dock firmware" >/dev/null
+viewwhole "$tmp/viewer --watch" >/dev/null
+[[ $(<"$tmp/viewer.args") == --watch ]] || fail "the viewer didn't get its options: '$(<"$tmp/viewer.args")'"
+[[ $(<"$tmp/viewed") == $'**BLOCKER:** waiting on the dock firmware\n\n# 0069 Pinned notes\n\nThe note in Markdown.' ]] ||
+  fail "the viewer wasn't given the blocker and the note: '$(<"$tmp/viewed")'"
+printf '# 0069 Pinned notes\n\n## Blockers\n- waiting on the dock firmware\n' >"$tmp/full"
+note set --workspace "$w1" --full-file "$tmp/full" "0069 · Short line" >/dev/null
+viewwhole "$tmp/viewer --watch" >/dev/null
+[[ $(head -1 "$tmp/viewed") == "# 0069 Pinned notes" ]] || fail "the blocker was repeated though the note says it: '$(<"$tmp/viewed")'"
+r=$(viewwhole "no-such-viewer-here")
+[[ $r == *"0069 Pinned notes"* ]] || fail "with no such viewer, less didn't show the note: '$r'"
+note unblock --workspace "$w1" >/dev/null
+echo "ok    PINBOARD_VIEWER shows the whole note, blocker first unless the note says it; less if it's missing"
+
 # The drawer: at the top of the tab you're in, 10% of its height, focus left where it was.
 hs tab focus "$t1" >/dev/null
 before=$(focused_in_tab "$p1")

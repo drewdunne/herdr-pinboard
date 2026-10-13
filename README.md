@@ -89,7 +89,7 @@ herdr --remote my-server --remote-keybindings server
 | `pinboard clear` | Remove it. |
 | `pinboard block "<what's blocking you>"` | Put `BLOCKER: …` at the top of the border and the drawer. `pinboard unblock` takes it off. |
 | `pinboard drawer [open\|close\|toggle]` | The drawers. `toggle`, the key's action, closes them all if this tab has one, and otherwise opens this tab's, and then each other tab's as you visit it. A drawer you close by hand (`q`) stays closed until the next toggle. |
-| `pinboard whole` | The whole note in a popup over this pane. It scrolls; `q` closes it. |
+| `pinboard whole` | The whole note in a popup over this pane. It scrolls; `q` closes it. `PINBOARD_VIEWER` picks the program it's shown in. |
 | `pinboard check [--hint TEXT]` | For an agent's prompt hook: a reminder to set a note when the workspace has none, and nothing otherwise. `--hint` adds your own conventions. |
 | `pinboard pause`, `pinboard resume` | Around an update; see [Updating](#updating). |
 | `pinboard refresh` | Relabel every pane from the notes, and close drawers that are no longer working. |
@@ -143,6 +143,7 @@ quotes, and `~/` means your home folder.
 | `PINBOARD_STATE_DIR` | herdr's state folder for the plugin | Where notes are kept: a folder per herdr session inside it. |
 | `PINBOARD_TITLE_SOURCE` | `pinboard` | The name pane titles are reported to herdr under. |
 | `PINBOARD_KEY_ACTIONS` | empty | Other action names whose keys open the drawer or the whole note, each ending in `.drawer` or `.whole`, so the hints find them. |
+| `PINBOARD_VIEWER` | `less` | The program that shows the whole note, with any options, such as `"mdroll"`. It's given the note as a Markdown file, with the blocker first unless the note already says it. If it isn't installed, `less` is used. |
 
 These are for moving over from another tool without copying anything: point the pinboard at
 that tool's notes folder (same layout: `<session>/<workspace>.line`, `.full`, `.blocker`, and a

@@ -1,0 +1,625 @@
+#!/bin/bash
+# A pinboard for each herdr workspace: one short line on the top border of every pane in the
+# workspace, and the whole note in a drawer at the top of each tab, opened and closed with a key.
+# A blocker goes at the top of both. herdr forgets pane titles when it restarts, so notes are kept
+# in files and the plugin's start-up step puts them back. See README.md.
+#   pinboard set [--workspace ID] [--full-file FILE] [--if-unset] "<line>"
+#                                   set a workspace's note (default: the workspace you're in)
+#   pinboard clear [--workspace ID]  remove it
+#   pinboard show [--workspace ID]   print it
+#   pinboard block [--workspace ID] "<what's blocking you>"
+#                                   put "BLOCKER: …" at the top of the pinboard; unblock removes it
+#   pinboard check [--hint TEXT]    for an agent's prompt hook: a reminder if its workspace has no
+#                                   pinboard yet, nothing otherwise
+#   pinboard drawer [open|close|toggle]
+#                                   the drawers: toggle (the default) closes them all if this tab
+#                                   has one, and otherwise opens this tab's, and each other tab's
+#                                   as you visit it
+#   pinboard whole                  the whole note, over this pane (it scrolls; q closes it)
+#   pinboard pause | resume         around an update: see README.md, "Updating"
+#   pinboard restore                put every note back after a restart (the start-up step)
+#   pinboard refresh                relabel every pane from the notes and close orphaned drawers,
+#                                   leaving working ones as they are
+#   pinboard hook                   run by herdr for the plugin's events and actions
+#   pinboard view drawer|whole      the programs inside the drawer and whole-note panes
+# Before the command, --session NAME works on that herdr session from outside a herdr pane.
+# Settings are read from pinboard.env in the plugin's config folder (README.md, "Settings").
+set -euo pipefail
+
+die() { echo "pinboard: $*" >&2; exit 1; }
+
+# Who this is: worked out from its own files, never from the registration that ran it, so it
+# behaves the same when another plugin's hook or a link runs it.
+self=$(readlink -f "$0")
+root=$(cd "$(dirname "$self")/.." && pwd)
+PLUGIN=$(sed -n 's/^id *= *"\([^"]*\)".*/\1/p' "$root/herdr-plugin.toml" 2>/dev/null | head -1)
+[[ -n $PLUGIN ]] || die "no plugin id in $root/herdr-plugin.toml"
+MAX_LINE=76     # herdr keeps a title's first 80 characters; "📌 " and room for "…"
+
+# herdr's own folders for this plugin (herdr's plugin_paths.rs). Hooks are told them; a command
+# run by hand works them out the same way.
+if [[ ${HERDR_PLUGIN_ID:-} == "$PLUGIN" && -n ${HERDR_PLUGIN_CONFIG_DIR:-} && -n ${HERDR_PLUGIN_STATE_DIR:-} ]]; then
+  config_dir=$HERDR_PLUGIN_CONFIG_DIR
+  default_base=$HERDR_PLUGIN_STATE_DIR
+elif [[ $PLUGIN =~ ^[a-z0-9._-]*[a-z0-9_-]$ ]]; then   # ids herdr uses unescaped as folder names
+  config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/herdr/plugins/config/$PLUGIN
+  default_base=${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$PLUGIN
+else
+  config_dir=$(herdr plugin config-dir "$PLUGIN")
+  default_base=${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$(basename "$config_dir")
+fi
+
+# Settings: plain KEY=value lines; a value in quotes may hold spaces, and ~/ is your home folder.
+unset PINBOARD_STATE_DIR PINBOARD_TITLE_SOURCE PINBOARD_KEY_ACTIONS
+if [[ -r $config_dir/pinboard.env ]]; then
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(PINBOARD_STATE_DIR|PINBOARD_TITLE_SOURCE|PINBOARD_KEY_ACTIONS)=(.*)$ ]] || continue
+    k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+    if [[ $v =~ ^\"([^\"]*)\" || $v =~ ^\'([^\']*)\' ]]; then v=${BASH_REMATCH[1]}; else v=${v%%[[:space:]]*}; fi
+    # shellcheck disable=SC2088  # a literal ~/ in the file
+    [[ $v == '~/'* ]] && v=$HOME/${v#'~/'}
+    printf -v "$k" '%s' "$v"
+  done <"$config_dir/pinboard.env"
+fi
+base=${PINBOARD_STATE_DIR:-$default_base}   # a folder per herdr session in here
+SOURCE=${PINBOARD_TITLE_SOURCE:-pinboard}   # the name pane titles are reported under
+
+session=
+if [[ ${1:-} == --session ]]; then
+  session=${2:?--session needs a name}
+  shift 2
+elif [[ -z ${HERDR_SOCKET_PATH:-} && -n ${HERDR_SESSION:-} ]]; then
+  session=$HERDR_SESSION   # herdr itself follows HERDR_SESSION when there's no socket path
+fi
+# With a session named, the caller's own pane, workspace and plugin context belong to some other
+# session (or none), so they're never used.
+if [[ -n $session ]]; then
+  unset HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_PLUGIN_CONTEXT_JSON HERDR_PLUGIN_EVENT_JSON
+fi
+
+hd() {
+  if [[ -n $session ]]; then
+    env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID \
+      -u HERDR_SESSION herdr --session "$session" "$@"
+  else
+    "${HERDR_BIN_PATH:-herdr}" "$@"
+  fi
+}
+
+# Which herdr session this is: named, or the default one. Plugin hooks and panes inside herdr have
+# HERDR_SOCKET_PATH, ending in sessions/<name>/herdr.sock for a named session.
+if [[ -z $session ]]; then
+  case ${HERDR_SOCKET_PATH:-} in
+    */sessions/*/herdr.sock) key=${HERDR_SOCKET_PATH%/herdr.sock}; key=${key##*/} ;;
+    *) key=default ;;
+  esac
+else
+  key=$session
+fi
+state=$base/$key
+mkdir -p "$state"
+drawers=$state/drawers          # "<pane> <tab>" for each open drawer
+drawers_on=$state/drawers.on    # present while drawers are switched on
+dismissed=$state/dismissed      # tabs whose drawer was closed by hand; they stay closed until the next toggle
+paused_flag=$base/paused        # present during an update; it holds "enabled=true|false|unknown"
+skipped=$state/startup-skipped  # this session started during an update; resume runs its start-up step
+
+lock() { exec 9>"$state/lock"; flock -w 30 9 || die "another pinboard is still running"; }
+
+# While paused, nothing touches a pane; notes are still written, and show on resume. Every command
+# that touches panes takes its session's lock first, and pause waits on every lock after setting
+# the flag, so nothing that started before it is still running once it returns.
+override=
+may_touch() { [[ -n $override || ! -e $paused_flag ]]; }
+
+socket_path() {
+  if [[ -n $session ]]; then
+    herdr session list --json | jq -r --arg s "$session" '.. | objects | select(.name? == $s) | .socket // .socket_path // empty' | head -1
+  else
+    echo "${HERDR_SOCKET_PATH:?}"
+  fi
+}
+
+# Focus one pane by id. The CLI only moves focus by direction; the socket API's pane.focus takes an id.
+focus_pane() {
+  SOCK=$(socket_path) python3 -I -c '
+import json, os, socket, sys
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["SOCK"])
+s.sendall((json.dumps({"id": "pinboard", "method": "pane.focus", "params": {"pane_id": sys.argv[1]}}) + "\n").encode())
+s.recv(65536)' "$1" >/dev/null 2>&1 || true
+}
+
+shorten() { # one line, cut at a word so it fits herdr's 80 characters
+  python3 -I -c '
+import sys
+s = " ".join(sys.argv[1].split()); m = int(sys.argv[2])
+if len(s) > m:
+    cut = s[:m]
+    if " " in cut: cut = cut.rsplit(" ", 1)[0]
+    s = cut.rstrip(" ,;:·-") + "…"
+print(s)' "$1" "$MAX_LINE"
+}
+
+# The keys bound to the drawer and the whole note, as you'd say them ("Ctrl+B then m"), read from
+# herdr's config: keys bound to this plugin's actions, or to the action names in
+# PINBOARD_KEY_ACTIONS (each ending in .drawer or .whole). Worked out once per run, when needed.
+keys_read='' drawer_key='' whole_key=''
+read_keys() {
+  [[ -n $keys_read ]] && return 0
+  keys_read=1
+  local out
+  out=$(python3 -I - "${HERDR_CONFIG_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml}" \
+    "$PLUGIN" "${PINBOARD_KEY_ACTIONS:-}" 2>/dev/null <<'PY'
+import sys, tomllib
+path, plugin, extra = sys.argv[1], sys.argv[2], sys.argv[3].split()
+try:
+    with open(path, "rb") as f:
+        cfg = tomllib.load(f)
+except Exception:
+    cfg = {}
+keys = cfg.get("keys") if isinstance(cfg.get("keys"), dict) else {}
+prefix = keys.get("prefix") or "ctrl+b"          # herdr's default
+want = {"drawer": [plugin + ".drawer"], "whole": [plugin + ".whole"]}
+for name in extra:
+    kind = name.rsplit(".", 1)[-1]
+    if kind in want:
+        want[kind].append(name)
+MODS = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "super": "Super", "meta": "Meta", "cmd": "Cmd"}
+def combo(s):
+    parts = [p for p in str(s).split("+") if p]
+    if not parts:
+        return ""
+    mods, k = [p.lower() for p in parts[:-1]], parts[-1]
+    if len(k) == 1:
+        k = k.upper() if mods else k             # "Ctrl+B", "Shift+M"; a key alone keeps its case
+    else:
+        k = k[:1].upper() + k[1:]
+    return "+".join([MODS.get(m, m.capitalize()) for m in mods] + [k])
+def say(k):
+    if isinstance(k, list):
+        k = k[0] if k else ""
+    k = str(k).strip()
+    if k.lower().startswith("prefix+"):
+        return combo(prefix) + " then " + combo(k[len("prefix+"):])
+    return combo(k)
+bound = keys.get("command") or []
+if isinstance(bound, dict):
+    bound = [bound]
+found = {}
+for kind, names in want.items():
+    found[kind] = next((say(c["key"]) for name in names for c in bound
+                        if isinstance(c, dict) and c.get("command") == name and c.get("key")
+                        and c.get("type", "plugin_action") == "plugin_action"), "")
+print(found["drawer"] + "\t" + found["whole"])
+PY
+  ) || out=$'\t'
+  drawer_key=${out%%$'\t'*}
+  whole_key=${out#*$'\t'}
+}
+
+this_workspace() {
+  [[ -n ${HERDR_WORKSPACE_ID:-} ]] && { echo "$HERDR_WORKSPACE_ID"; return; }
+  hd pane current | jq -r '.result.pane.workspace_id // empty'
+}
+
+# Where the focus is right now: "<tab> <pane>". Hooks run a moment after their event, and the
+# focus may have moved on since, so drawer decisions use this, not the event.
+live_focus() { hd api snapshot | jq -r '.result.snapshot | "\(.focused_tab_id // "") \(.focused_pane_id // "")"'; }
+
+panes() { hd pane list | jq -r '.result.panes[] | "\(.pane_id)\t\(.workspace_id)\t\(.tab_id)\t\(.title // "")"'; }
+
+is_drawer() { grep -q "^$1 " "$drawers" 2>/dev/null; }
+
+title_for() { # title_for PANE WORKSPACE: the title this pane should have, empty for none
+  if is_drawer "$1"; then
+    read_keys
+    if [[ -n $drawer_key ]]; then echo "📌 pinboard · $drawer_key closes"
+    else echo "📌 pinboard · bind a key to $PLUGIN.drawer to close it"; fi
+  elif [[ -s $state/$2.blocker ]]; then
+    echo "📌 $(shorten "BLOCKER: $(<"$state/$2.blocker") · $(cat "$state/$2.line" 2>/dev/null)")"
+  elif [[ -s $state/$2.line ]]; then
+    echo "📌 $(<"$state/$2.line")"
+  fi
+}
+
+label() { # label PANE WORKSPACE CURRENT_TITLE
+  may_touch || return 0
+  local want
+  want=$(title_for "$1" "$2")
+  if [[ -n $want ]]; then
+    [[ $want == "$3" ]] || hd pane report-metadata "$1" --source "$SOURCE" --title "$want" >/dev/null 2>&1 || true
+  elif [[ $3 == "📌 "* ]]; then
+    hd pane report-metadata "$1" --source "$SOURCE" --clear-title >/dev/null 2>&1 || true
+  fi
+}
+
+# Work each pane's title out afresh from the files, so it doesn't matter in which order changes land.
+relabel() { # relabel [WORKSPACE]
+  may_touch || return 0
+  local pane ws tab title
+  while IFS=$'\t' read -r pane ws tab title; do
+    [[ -z ${1:-} || $ws == "$1" ]] || continue
+    label "$pane" "$ws" "$title"
+  done < <(panes)
+}
+
+relabel_pane() {
+  may_touch || return 0
+  local info
+  info=$(hd pane get "$1" 2>/dev/null) || return 0
+  label "$1" "$(jq -r '.result.pane.workspace_id' <<<"$info")" "$(jq -r '.result.pane.title // ""' <<<"$info")"
+}
+
+# Forget drawers herdr no longer has. The pinboard unlists its own drawers before closing them, so
+# a listed drawer that vanished was closed by hand: its tab is dismissed, even if this runs before
+# that pane's pane.closed hook (hooks can run in any order).
+prune_drawers() {
+  [[ -s $drawers ]] || return 0
+  local live
+  live=" $(panes | cut -f1 | tr '\n' ' ')"
+  awk -v live="$live" '!index(live, " " $1 " ") {print $2}' "$drawers" >>"$dismissed"
+  awk -v live="$live" 'index(live, " " $1 " ")' "$drawers" >"$drawers.tmp" || true
+  mv "$drawers.tmp" "$drawers"
+}
+
+tab_has_drawer() { awk -v t="$1" '$2==t{f=1} END{exit !f}' "$drawers" 2>/dev/null; }
+
+# A drawer at the top of the tab that has the focus: herdr only splits right or down, so it opens
+# below the tab's top-left pane, swaps above it, and shrinks to herdr's smallest split (10% of the
+# tab). Opening moves the focus into it even with --no-focus, so the focus goes back to the pane
+# that had it, but only while it's still in the drawer: if you've moved on, it's left alone.
+open_drawer() { # open_drawer [--if-noted]: with --if-noted, only in a workspace that has a note
+  may_touch || return 0
+  local tab pane any ws lay first focused dp now
+  read -r tab pane < <(live_focus)
+  [[ -n $tab ]] || return 0
+  tab_has_drawer "$tab" && return 0
+  grep -qx "$tab" "$dismissed" 2>/dev/null && return 0
+  read -r any ws < <(panes | awk -F'\t' -v t="$tab" '$3==t{print $1, $2; exit}')
+  [[ -n $any ]] || return 0
+  [[ ${1:-} == --if-noted && ! -s $state/$ws.line ]] && return 0
+  lay=$(hd pane layout --pane "$any") || return 0
+  first=$(jq -r '[.result.layout.panes[]] | sort_by(.rect.y, .rect.x) | .[0].pane_id' <<<"$lay")
+  focused=$(jq -r '.result.layout.focused_pane_id // empty' <<<"$lay")
+  dp=$(hd plugin pane open --plugin "$PLUGIN" --entrypoint drawer --placement split --direction down \
+    --target-pane "$first" --no-focus | jq -r '.result.plugin_pane.pane.pane_id // empty') || dp=
+  [[ -n $dp ]] || return 0
+  echo "$dp $tab" >>"$drawers"
+  # herdr's swap also switches to the swapped pane's tab, so it only runs while you're still in
+  # this one; if you've just moved on, the drawer is taken back down instead.
+  local now_tab
+  read -r now_tab _ < <(live_focus)
+  if [[ $now_tab != "$tab" ]] ||
+    ! hd pane swap --source-pane "$dp" --target-pane "$first" >/dev/null 2>&1 ||
+    ! hd pane resize --pane "$dp" --direction up --amount 0.45 >/dev/null 2>&1; then
+    # Not made, or half made: unlisted first (so its pane.closed isn't taken for a close by hand),
+    # then closed, and listed again if it's still there, so the next close can try again.
+    awk -v p="$dp" '$1!=p' "$drawers" >"$drawers.tmp"; mv "$drawers.tmp" "$drawers"
+    if ! hd plugin pane close "$dp" >/dev/null 2>&1 && hd pane get "$dp" >/dev/null 2>&1; then
+      echo "$dp $tab" >>"$drawers"
+    fi
+  fi
+  read -r _ now < <(live_focus)
+  [[ -n $focused && $now == "$dp" ]] && focus_pane "$focused"
+  is_drawer "$dp" && label "$dp" "" ""
+  return 0
+}
+
+# Closing drawers. While herdr runs, a drawer belongs to a plugin, and `plugin pane close` refuses
+# any pane that doesn't ("plugin pane not found"), so a stale list can't close anyone's real pane.
+# It closes any plugin's pane, so drawers another tool opened from the same notes folder close too.
+close_drawers() {
+  may_touch || return 0
+  local list dp tab
+  list=$(cat "$drawers" 2>/dev/null || true)
+  : >"$drawers"   # emptied first, so the pane.closed hooks see these as ours, not closed by hand
+  local out
+  while read -r dp tab; do
+    [[ -n $dp ]] || continue
+    out=$(hd plugin pane close "$dp" 2>&1) && continue
+    # Not a plugin pane (never a drawer, or one a restart turned into a shell): forget it. Any
+    # other failure with the pane still there: keep it listed, so the next close tries again.
+    [[ $out == *plugin_pane_not_found* ]] && continue
+    if hd pane get "$dp" >/dev/null 2>&1; then echo "$dp $tab" >>"$drawers"; fi
+  done <<<"$list"
+}
+
+# Drawers that are no longer the plugin's: after a restart herdr brings a drawer back with its id
+# and label but as a bare shell, and registering the plugin again orphans open drawers the same
+# way. Unlisted ones are closed by both marks a drawer has: herdr's label "Pinboard" (the
+# manifest's pane title) and this plugin's folder as its working folder.
+close_leftover_drawers() {
+  may_touch || return 0
+  local dp cwd
+  while IFS=$'\t' read -r dp cwd; do
+    is_drawer "$dp" && continue
+    if [[ $(readlink -f "$cwd") == "$root" ]]; then hd pane close "$dp" >/dev/null 2>&1 || true; fi
+  done < <(hd api snapshot | jq -r '.result.snapshot.panes[]? | select(.label == "Pinboard") | "\(.pane_id)\t\(.cwd)"')
+}
+
+drawer() { # drawer open|close|toggle
+  prune_drawers
+  local tab
+  read -r tab _ < <(live_focus)
+  case ${1:-toggle} in
+    toggle) if [[ -n $tab ]] && tab_has_drawer "$tab"; then drawer close; else drawer open; fi; return ;;
+    open)
+      touch "$drawers_on"; : >"$dismissed"
+      open_drawer ;;
+    close)
+      rm -f "$drawers_on"; : >"$dismissed"
+      close_drawers
+      close_leftover_drawers ;;
+    *) die "drawer: open, close or toggle" ;;
+  esac
+}
+
+ensure_drawer() { # while drawers are on, the tab you're in gets one, if its workspace has a note
+  [[ -e $drawers_on ]] || return 0
+  prune_drawers
+  open_drawer --if-noted
+}
+
+# A drawer that closed while still listed was closed by hand (x): that tab stays without one until
+# the next toggle.
+drawer_closed() { # drawer_closed PANE
+  local tab
+  tab=$(awk -v p="$1" '$1==p{print $2}' "$drawers" 2>/dev/null)
+  [[ -n $tab ]] || return 0
+  awk -v p="$1" '$1!=p' "$drawers" >"$drawers.tmp"; mv "$drawers.tmp" "$drawers"
+  echo "$tab" >>"$dismissed"
+}
+
+restore() {
+  rm -f "$skipped"
+  : >"$drawers"
+  close_leftover_drawers
+  : >"$dismissed"
+  relabel
+  ensure_drawer
+}
+
+event_field() { jq -r "$1 // empty" <<<"${HERDR_PLUGIN_EVENT_JSON:-{}}" 2>/dev/null || true; }
+
+hook() {
+  case ${HERDR_PLUGIN_EVENT:-}:${HERDR_PLUGIN_ACTION_ID:-} in
+    startup:*) restore ;;
+    pane.created:*|pane.moved:*)
+      local p; p=$(event_field '.data.pane.pane_id // .data.pane_id')
+      if [[ -n $p ]]; then relabel_pane "$p"; else relabel; fi ;;
+    pane.closed:*)
+      local p; p=$(event_field '.data.pane.pane_id // .data.pane_id')
+      [[ -n $p ]] && drawer_closed "$p" ;;
+    tab.focused:*|workspace.focused:*) ensure_drawer ;;
+    workspace.closed:*)
+      local w; w=$(event_field '.data.workspace.workspace_id // .data.workspace_id')
+      [[ -n $w ]] && rm -f "$state/$w.line" "$state/$w.full" "$state/$w.blocker" ;;
+    *:drawer) drawer toggle ;;
+    *:whole) whole ;;
+    *:restore) restore ;;
+  esac
+  return 0
+}
+
+whole() { # a popup, as the manifest says
+  may_touch || return 0
+  hd plugin pane open --plugin "$PLUGIN" --entrypoint whole >/dev/null
+}
+
+# The programs inside the drawer and whole-note panes. The note is wrapped to the width herdr
+# gives the pane (an overlay over one pane of a split keeps that pane's width).
+wrap_note() { # wrap_note COLUMNS < TEXT: the note, wrapped, with deep indents kept from crushing it
+  python3 -I -c '
+import sys, textwrap
+cols = int(sys.argv[1])
+text = sys.stdin.read().strip("\n") or "This workspace has no pinboard yet. Set one with: pinboard set \"<one line>\""
+w = max(20, cols - 2)
+for line in text.split("\n"):
+    ind = min(len(line) - len(line.lstrip()), w // 3)
+    print("\n".join(textwrap.wrap(line.strip(), width=w - ind - 1, initial_indent=" " * (ind + 1),
+                                  subsequent_indent=" " * (ind + 1))))' "$1" 2>/dev/null ||
+    echo " (the note couldn't be shown)"
+}
+
+note_file() { # the whole note if there is one, else the line; worked out afresh each time
+  if [[ -s $state/$1.full ]]; then echo "$state/$1.full"; else echo "$state/$1.line"; fi
+}
+
+pinboard_text() { # pinboard_text WORKSPACE FILE: the blocker first, if there is one, then the note
+  if [[ -s $state/$1.blocker ]]; then printf 'BLOCKER: %s\n\n' "$(<"$state/$1.blocker")"; fi
+  cat "$2" 2>/dev/null || true
+}
+
+view() { # view drawer|whole
+  local ws f
+  ws=${HERDR_WORKSPACE_ID:-}
+  [[ -n $ws ]] || ws=$(jq -r '.workspace_id // empty' <<<"${HERDR_PLUGIN_CONTEXT_JSON:-{}}" 2>/dev/null || true)
+  if [[ $1 == whole ]]; then
+    # The whole note scrolls in less (arrows, space, b); q closes it.
+    f=$(note_file "$ws")
+    { echo; pinboard_text "$ws" "$f" | wrap_note "$(stty size 2>/dev/null | cut -d' ' -f2 || echo 80)"; } |
+      less -R -P "q closes · space scrolls" || true
+    return 0
+  fi
+  # The drawer: redrawn when the note or the drawer's size changes; q closes it.
+  read_keys
+  local hint
+  if [[ -n $whole_key ]]; then hint=" … $whole_key for the rest"
+  else hint=" … for the rest, bind a key to $PLUGIN.whole"; fi
+  stty -icanon -echo 2>/dev/null || true
+  printf '\e[?25l'
+  local seen='' now size rows cols k lines
+  while :; do
+    f=$(note_file "$ws")
+    size=$(stty size 2>/dev/null || echo "24 80")
+    now="$size $f $({ stat -c '%i:%s:%.9Y' "$f" "$state/$ws.blocker" 2>/dev/null || true; } | tr '\n' ' ')"
+    if [[ $now != "$seen" ]]; then
+      seen=$now
+      rows=${size% *} cols=${size#* }
+      mapfile -t lines < <(pinboard_text "$ws" "$f" | wrap_note "$cols")
+      if (( ${#lines[@]} > rows )); then
+        lines=("${lines[@]:0:rows-1}" "${hint:0:cols-1}")
+      fi
+      printf '\e[H\e[2J%s' "$(printf '%s\n' "${lines[@]}")"
+    fi
+    if read -r -n1 -t 0.5 k && [[ $k == q ]]; then break; fi
+  done
+}
+
+set_note() {
+  local ws='' full='' if_unset='' line
+  while [[ ${1:-} == --* ]]; do
+    case $1 in
+      --workspace) ws=${2:?}; shift 2 ;;
+      --full-file) full=${2:?}; shift 2 ;;
+      --if-unset) if_unset=1; shift ;;
+      *) die "set: unknown option $1" ;;
+    esac
+  done
+  [[ $# -ge 1 && -n $1 ]] || die 'usage: pinboard set [--workspace ID] [--full-file FILE] [--if-unset] "<line>"'
+  ws=${ws:-$(this_workspace)}
+  [[ -n $ws ]] || die "not in a herdr workspace; pass --workspace ID"
+  [[ -n $if_unset && -s $state/$ws.line ]] && return 0
+  line=$(shorten "$1")
+  # Written whole and then moved into place, so an open drawer never reads half a note.
+  if [[ -n $full ]]; then cp "$full" "$state/$ws.full.tmp"; else printf '%s\n' "$1" >"$state/$ws.full.tmp"; fi
+  printf '%s\n' "$line" >"$state/$ws.line.tmp"
+  mv "$state/$ws.full.tmp" "$state/$ws.full"
+  mv "$state/$ws.line.tmp" "$state/$ws.line"
+  relabel "$ws"
+}
+
+block() { # block [--workspace ID] "<what's blocking you>"
+  local ws=''
+  [[ ${1:-} == --workspace ]] && { ws=${2:?}; shift 2; }
+  [[ -n ${1:-} ]] || die 'usage: pinboard block [--workspace ID] "<what is blocking you>"'
+  ws=${ws:-$(this_workspace)}
+  [[ -n $ws ]] || die "not in a herdr workspace; pass --workspace ID"
+  printf '%s\n' "$(echo "$*" | tr -s '[:space:]' ' ' | sed 's/ *$//')" >"$state/$ws.blocker.tmp"
+  mv "$state/$ws.blocker.tmp" "$state/$ws.blocker"
+  relabel "$ws"
+}
+
+# For an agent's prompt hook: inside a herdr workspace with no pinboard, tell the agent to set one.
+# Prints nothing otherwise, and never fails. --hint adds your own conventions to the reminder.
+check() {
+  local hint=''
+  [[ ${1:-} == --hint ]] && hint=${2:-}
+  [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_WORKSPACE_ID:-} ]] || return 0
+  [[ -s $state/$HERDR_WORKSPACE_ID.line ]] && return 0
+  echo "This herdr workspace has no pinboard yet. Set one in your first reply, before other work: pinboard set \"<one line saying what this workspace is for>\", with --full-file for a longer note.${hint:+ $hint}"
+}
+
+# Pause and resume, around an update. Installing a plugin again registers it again, which orphans
+# its open drawers and switches it on, so: pause closes the drawers (they stay switched on) and
+# stops anything touching a pane; install; resume puts the on or off state back and reopens.
+herdr_running_sessions() { herdr session list --json 2>/dev/null | jq -r '.sessions[]? | select(.running) | .name' || true; }
+# The plugin list is shared by every session, but switching a plugin on or off needs a running
+# server: this one, or else any that's running.
+acct() {
+  if [[ -z $session && -n ${HERDR_SOCKET_PATH:-} ]]; then "${HERDR_BIN_PATH:-herdr}" "$@"; return; fi
+  local s; s=$(herdr_running_sessions | head -1)
+  if [[ -n $s ]]; then
+    env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID \
+      -u HERDR_SESSION herdr --session "$s" "$@"
+  else
+    herdr "$@"
+  fi
+}
+plugin_enabled() { # true, false, or nothing when herdr doesn't list the plugin
+  acct plugin list --json 2>/dev/null | jq -r --arg id "$PLUGIN" '.result.plugins[]? | select(.plugin_id == $id) | .enabled' || true
+}
+
+pause() {
+  exec 8>"$base/pause.lock"; flock -w 300 8 || die "another pause or resume is still running"
+  if [[ ! -e $paused_flag ]]; then
+    local on; on=$(plugin_enabled)
+    printf 'enabled=%s\n' "${on:-unknown}" >"$paused_flag.tmp"
+    mv "$paused_flag.tmp" "$paused_flag"
+  fi
+  # Wait for work under way in every session, new ones included, and close the drawers in the
+  # running ones.
+  local running seen='' d s
+  running=" $(herdr_running_sessions | tr '\n' ' ') "
+  while :; do
+    local more=''
+    for d in "$base"/*/; do
+      [[ -d $d ]] || continue
+      s=$(basename "$d")
+      [[ " $seen " == *" $s "* ]] && continue
+      seen="$seen $s" more=1
+      if [[ $running == *" $s "* ]]; then
+        bash "$self" --session "$s" _pause-session || echo "pinboard: couldn't close the drawers in herdr session $s" >&2
+      else
+        ( exec 9>"$d/lock"; flock -w 30 9 ) || true
+      fi
+    done
+    [[ -n $more ]] || break
+  done
+  echo "pinboard: paused (drawers closed; they reopen on resume)"
+}
+
+resume() {
+  exec 8>"$base/pause.lock"; flock -w 300 8 || die "another pause or resume is still running"
+  [[ -e $paused_flag ]] || { echo "pinboard: not paused"; return 0; }
+  local want now s
+  want=$(sed -n 's/^enabled=//p' "$paused_flag")
+  now=$(plugin_enabled)
+  if [[ $want == false && $now == true ]]; then
+    acct plugin disable "$PLUGIN" >/dev/null || die "couldn't switch the plugin off again; it's still paused"
+  elif [[ $want == true && $now == false ]]; then
+    acct plugin enable "$PLUGIN" >/dev/null || die "couldn't switch the plugin on again; it's still paused"
+  fi
+  rm -f "$paused_flag"
+  if [[ $want == false ]]; then echo "pinboard: resumed (switched off, as before)"; return 0; fi
+  for s in $(herdr_running_sessions); do
+    bash "$self" --session "$s" _resume-session || echo "pinboard: couldn't relabel herdr session $s" >&2
+  done
+  echo "pinboard: resumed"
+}
+
+cmd=${1:-}
+[[ -n $cmd ]] || die "usage: pinboard [--session NAME] set|clear|show|block|unblock|check|drawer|whole|pause|resume|restore|refresh|hook|view"
+shift
+paused_note() { echo "pinboard: paused for an update; try again once it's resumed" >&2; }
+case $cmd in
+  set) lock; set_note "$@" ;;
+  clear)
+    lock
+    [[ ${1:-} == --workspace ]] && ws=${2:?} || ws=$(this_workspace)
+    rm -f "$state/$ws.line" "$state/$ws.full" "$state/$ws.blocker"; relabel "$ws" ;;
+  show)
+    [[ ${1:-} == --workspace ]] && ws=${2:?} || ws=$(this_workspace)
+    [[ -s $state/$ws.line ]] || { echo "workspace $ws has no pinboard"; exit 0; }
+    if [[ -s $state/$ws.blocker ]]; then echo "BLOCKER: $(<"$state/$ws.blocker")"; fi
+    cat "$state/$ws.line" "$state/$ws.full" 2>/dev/null || true ;;
+  block) lock; block "$@" ;;
+  unblock)
+    lock
+    [[ ${1:-} == --workspace ]] && ws=${2:?} || ws=$(this_workspace)
+    rm -f "$state/$ws.blocker"; relabel "$ws" ;;
+  check) check "$@" ;;
+  drawer) lock; if may_touch; then drawer "${1:-toggle}"; else paused_note; fi ;;
+  whole) lock; if may_touch; then whole; else paused_note; fi ;;
+  restore) lock; if may_touch; then restore; else paused_note; fi ;;
+  refresh) lock; if may_touch; then prune_drawers; close_leftover_drawers; relabel; else paused_note; fi ;;
+  pause) pause ;;
+  resume) resume ;;
+  _pause-session) lock; override=1; close_drawers; close_leftover_drawers ;;
+  _resume-session)
+    lock
+    if [[ -e $skipped ]]; then restore; else prune_drawers; relabel; ensure_drawer; fi ;;
+  hook)
+    # Focus changes are frequent; with the drawers off they have nothing to do.
+    [[ ${HERDR_PLUGIN_EVENT:-} == *.focused && ! -e $drawers_on ]] && exit 0
+    lock
+    if may_touch; then hook; exit 0; fi
+    # Paused: only the bookkeeping that touches no pane.
+    case ${HERDR_PLUGIN_EVENT:-} in
+      startup) touch "$skipped" ;;
+      pane.closed|workspace.closed) hook ;;
+    esac ;;
+  view) view "${1:?view drawer|whole}" ;;
+  _keys) read_keys; printf '%s\t%s\n' "$drawer_key" "$whole_key" ;;   # for the tests
+  *) die "unknown command: $cmd" ;;
+esac

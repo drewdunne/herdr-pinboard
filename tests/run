@@ -1,0 +1,405 @@
+#!/bin/bash
+# Tests for the pinboard, against a real herdr in a throwaway folder. Plugins are global to the
+# account, so the test gets its own config and plugin list (XDG_CONFIG_HOME and XDG_STATE_HOME in a
+# scratch folder) and every HERDR_ variable is unset: from inside a herdr pane, herdr would
+# otherwise follow them to the herdr you're using. It checks that before registering anything,
+# and never touches your own herdr.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd -P "$here/.." && pwd)
+command -v herdr >/dev/null || { echo "skip  herdr isn't installed"; exit 0; }
+tmp=$(mktemp -d /tmp/pinboard.XXXX)   # short: herdr's socket path must fit in 108 characters
+S=t
+S2=u
+ID=drewdunne.pinboard
+
+clean=(env)   # every HERDR_ variable unset, and the scratch folders in place of yours
+for v in $(compgen -e | grep '^HERDR_' || true); do clean+=(-u "$v"); done
+clean+=(XDG_CONFIG_HOME="$tmp/cfg" XDG_STATE_HOME="$tmp/state")
+
+cleanup() {
+  for s in "$S" "$S2"; do h --session "$s" server stop >/dev/null 2>&1 || true; done
+  if [[ -n ${server_pid:-} ]]; then kill "$server_pid" 2>/dev/null || true; fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+h() { "${clean[@]}" herdr "$@"; }
+hs() { h --session "$S" "$@"; }
+hu() { h --session "$S2" "$@"; }
+pb() { "${clean[@]}" "$root/bin/pinboard" "$@"; }   # as you'd run it outside herdr
+note() { pb --session "$S" "$@"; }
+fail() {
+  echo "FAIL  $*"
+  echo "--- plugin log:"; hs plugin log list 2>/dev/null | jq -c '.result.logs[-8:][]? | {action: (.action_id // .event), exit: .exit_code, err: ((.stderr // "")[0:400])}' || true
+  exit 1
+}
+wait_for() { # wait_for SECONDS COMMAND...: hooks run a moment after the change that fires them
+  local end=$((SECONDS + $1)); shift
+  until "$@"; do (( SECONDS < end )) || return 1; sleep 0.3; done
+}
+not() { ! "$@"; }
+
+base=$tmp/state/herdr/plugins/$ID   # herdr's state folder for the plugin: notes by default
+title() { hs pane get "$1" | jq -r '.result.pane.title // ""'; }
+has_title() { [[ $(title "$1") == "$2" ]]; }
+no_title() { [[ -z $(title "$1") ]]; }
+tab_panes() { hs pane layout --pane "$1" | jq -r '[.result.layout.panes[] | .pane_id] | join(" ")'; }
+top_pane() { hs pane layout --pane "$1" | jq -r '[.result.layout.panes[]] | sort_by(.rect.y, .rect.x) | .[0].pane_id'; }
+focused_in_tab() { hs pane layout --pane "$1" | jq -r '.result.layout.focused_pane_id'; }
+drawer_of() { awk -v t="$1" '$2==t{print $1}' "$base/$S/drawers" 2>/dev/null; }
+has_drawer() { local d; d=$(drawer_of "$1"); [[ -n $d && $(top_pane "$2") == "$d" ]]; }
+pane_count() { hs pane layout --pane "$1" | jq '.result.layout.panes | length'; }
+no_drawer() { [[ -z $(drawer_of "$1") && $(pane_count "$2") == "$3" ]]; }   # no_drawer TAB PANE PANES_WITHOUT_ONE
+drawer_panes() { h --session "$1" api snapshot | jq '[.result.snapshot.panes[] | select(.label == "Pinboard")] | length'; }
+listed() { grep -c . "$base/$1/drawers" 2>/dev/null || true; }
+enabled() { hs plugin list --json | jq -r --arg id "$ID" '.result.plugins[] | select(.plugin_id == $id) | .enabled'; }
+reregister() { hs plugin unlink "$ID" >/dev/null; hs plugin link "$root" >/dev/null; }   # what installing again does
+
+mkdir -p "$tmp/cfg/herdr"
+# herdr's default prefix (Ctrl+B), with the README's two keys.
+cat >"$tmp/cfg/herdr/config.toml" <<EOF
+onboarding = false
+
+[[keys.command]]
+key = "prefix+m"
+type = "plugin_action"
+command = "$ID.drawer"
+
+[[keys.command]]
+key = "prefix+shift+m"
+type = "plugin_action"
+command = "$ID.whole"
+EOF
+
+# Sealed off: this herdr sees none of your running sessions, and has no plugins.
+[[ $(h session list --json | jq '[.sessions[] | select(.running)] | length') == 0 ]] ||
+  fail "the test's herdr can see a running session; refusing to register a plugin"
+h plugin link "$root" >/dev/null
+[[ $(h plugin list --json | jq -r '[.result.plugins[].plugin_id] | join(",")') == "$ID" ]] ||
+  fail "the plugin isn't the only one in the test's list"
+echo "ok    the test's herdr is sealed off from yours, and has only this plugin"
+
+# The key hints, read from herdr's config: its default prefix, another prefix, other action names
+# through PINBOARD_KEY_ACTIONS, and no keys at all.
+keys() { # keys CONFIG_TOML [SETTINGS]: what the hints say, "<drawer>|<whole>"
+  local d; d=$(mktemp -d "$tmp/k.XXXX")
+  mkdir -p "$d/herdr/plugins/config/$ID"
+  printf '%s\n' "$1" >"$d/herdr/config.toml"
+  [[ -n ${2:-} ]] && printf '%s\n' "$2" >"$d/herdr/plugins/config/$ID/pinboard.env"
+  "${clean[@]}" XDG_CONFIG_HOME="$d" "$root/bin/pinboard" _keys | tr '\t' '|'
+}
+k=$(keys "$(cat "$tmp/cfg/herdr/config.toml")")
+[[ $k == "Ctrl+B then m|Ctrl+B then Shift+M" ]] || fail "with herdr's default prefix the hints say '$k'"
+other='[keys]
+prefix = "ctrl+space"
+[[keys.command]]
+key = "prefix+m"
+type = "plugin_action"
+command = "arkship.ark-note.drawer"
+[[keys.command]]
+key = "prefix+shift+m"
+type = "plugin_action"
+command = "arkship.ark-note.whole"'
+k=$(keys "$other")
+[[ $k == "|" ]] || fail "keys bound to another plugin's actions were taken without PINBOARD_KEY_ACTIONS: '$k'"
+k=$(keys "$other" 'PINBOARD_KEY_ACTIONS="arkship.ark-note.drawer arkship.ark-note.whole"   # old names')
+[[ $k == "Ctrl+Space then m|Ctrl+Space then Shift+M" ]] || fail "PINBOARD_KEY_ACTIONS with another prefix gave '$k'"
+k=$(keys 'onboarding = false')
+[[ $k == "|" ]] || fail "with no keys bound the hints say '$k'"
+echo "ok    key hints follow herdr's config: its default prefix, another prefix, PINBOARD_KEY_ACTIONS, no keys"
+
+start() { # start SESSION
+  ( h --session "$1" server >"$tmp/server-$1.log" 2>&1 & echo $! >"$tmp/server-$1.pid" )
+  [[ $1 == "$S" ]] && server_pid=$(<"$tmp/server-$1.pid")
+  wait_for 15 h --session "$1" status >/dev/null 2>&1 || fail "the test's herdr server $1 didn't start"
+}
+stop() { # stop SESSION
+  local pid; pid=$(<"$tmp/server-$1.pid")
+  h --session "$1" server stop >/dev/null 2>&1 || true
+  wait_for 15 not kill -0 "$pid" 2>/dev/null || fail "the test's server $1 didn't stop"
+}
+start "$S"
+# A headless herdr starts with no workspace.
+p1=$(hs workspace create --label main --focus | jq -r '.result.root_pane.pane_id')
+w1=$(hs pane get "$p1" | jq -r '.result.pane.workspace_id')
+t1=$(hs pane get "$p1" | jq -r '.result.pane.tab_id')
+out=$(hs workspace create --label other --no-focus)
+q1=$(jq -r '.result.root_pane.pane_id' <<<"$out")
+w2=$(hs pane get "$q1" | jq -r '.result.pane.workspace_id')
+
+# One command sets a note; every pane in that workspace carries it, and no other workspace does.
+note set --workspace "$w1" "0069 · A pinned note on every pane" >/dev/null
+has_title "$p1" "📌 0069 · A pinned note on every pane" || fail "set didn't label the workspace's pane: '$(title "$p1")'"
+no_title "$q1" || fail "another workspace's pane got the note: '$(title "$q1")'"
+[[ -s $base/$S/$w1.line ]] || fail "the note isn't in herdr's state folder for the plugin"
+echo "ok    pinboard set labels the workspace's panes, and only them"
+
+p2=$(hs pane split "$p1" --direction right --no-focus | jq -r '.result.pane.pane_id')
+wait_for 10 has_title "$p2" "📌 0069 · A pinned note on every pane" || fail "a split pane wasn't labeled: '$(title "$p2")'"
+p3=$(hs tab create --workspace "$w1" --label two --no-focus | jq -r '.result.root_pane.pane_id')
+t2=$(hs pane get "$p3" | jq -r '.result.pane.tab_id')
+wait_for 10 has_title "$p3" "📌 0069 · A pinned note on every pane" || fail "a new tab's pane wasn't labeled: '$(title "$p3")'"
+echo "ok    new panes and new tabs get the note (pane.created hook)"
+
+long="0069 · A pinned note at the top of every herdr tab or pane saying what its workspace is about, with a hotkey to fold it"
+note set --workspace "$w1" "$long" >/dev/null
+t=$(title "$p1")
+[[ ${#t} -le 80 && $t == *… && $t == "📌 0069 · A pinned note at the top"* ]] || fail "a long note wasn't cut to 80 at a word: '$t' (${#t})"
+note set --workspace "$w1" --if-unset "something else" >/dev/null
+[[ $(title "$p1") == "$t" ]] || fail "--if-unset replaced an existing note"
+printf 'Line one of the whole note\nLine two\n' >"$tmp/full"
+note set --workspace "$w1" --full-file "$tmp/full" "0069 · Short line" >/dev/null
+[[ $(note show --workspace "$w1") == $'0069 · Short line\nLine one of the whole note\nLine two' ]] ||
+  fail "show didn't print the line and the whole note: $(note show --workspace "$w1")"
+echo "ok    long lines are cut at a word to fit herdr's 80 characters; --if-unset and --full-file work"
+
+# A blocker goes first on every pane's border and at the top of the whole note.
+note block --workspace "$w1" "waiting on the dock firmware" >/dev/null
+has_title "$p1" "📌 BLOCKER: waiting on the dock firmware · 0069 · Short line" || fail "block didn't put the blocker first: '$(title "$p1")'"
+[[ $(note show --workspace "$w1" | head -1) == "BLOCKER: waiting on the dock firmware" ]] || fail "show doesn't start with the blocker"
+note unblock --workspace "$w1" >/dev/null
+has_title "$p1" "📌 0069 · Short line" || fail "unblock didn't remove the blocker: '$(title "$p1")'"
+echo "ok    block puts BLOCKER: first on every border and in the note; unblock takes it off"
+
+# The reminder for a prompt hook: silent where there's a pinboard or no herdr, a reminder where
+# there's none, with --hint added.
+chk() { "${clean[@]}" HERDR_SOCKET_PATH="$tmp/cfg/herdr/sessions/$S/herdr.sock" "$@"; }
+[[ -z $(chk HERDR_ENV=1 HERDR_WORKSPACE_ID="$w1" "$root/bin/pinboard" check) ]] || fail "check spoke in a workspace that has a pinboard"
+r=$(chk HERDR_ENV=1 HERDR_WORKSPACE_ID=w999 "$root/bin/pinboard" check)
+[[ $r == *"no pinboard yet"* && $r == *'pinboard set "'* ]] || fail "check said nothing useful in a workspace with no pinboard: '$r'"
+r=$(chk HERDR_ENV=1 HERDR_WORKSPACE_ID=w999 "$root/bin/pinboard" check --hint "Start it with the ticket number.")
+[[ $r == *"no pinboard yet"*" Start it with the ticket number." ]] || fail "check --hint didn't add the hint: '$r'"
+[[ -z $(chk "$root/bin/pinboard" check) ]] || fail "check spoke outside herdr"
+echo "ok    check reminds an agent only where its workspace has no pinboard, with --hint added"
+
+# The drawer: at the top of the tab you're in, 10% of its height, focus left where it was.
+hs tab focus "$t1" >/dev/null
+before=$(focused_in_tab "$p1")
+note drawer toggle >/dev/null
+wait_for 5 has_drawer "$t1" "$p1" || fail "no drawer at the top of tab $t1: $(tab_panes "$p1") / $(cat "$base/$S/drawers" 2>/dev/null)"
+d1=$(drawer_of "$t1")
+[[ $(focused_in_tab "$p1") == "$before" ]] || fail "the drawer took the focus ($(focused_in_tab "$p1"), was $before)"
+height=$(hs pane layout --pane "$d1" | jq --arg d "$d1" '[.result.layout.panes[] | select(.pane_id == $d)][0].rect.height')
+total=$(hs pane layout --pane "$d1" | jq '.result.layout.area.height')
+(( height * 100 <= total * 12 )) || fail "the drawer is $height of $total rows, more than herdr's 10%"
+wait_for 5 has_title "$d1" "📌 pinboard · Ctrl+B then m closes" || fail "the drawer's border says '$(title "$d1")'"
+echo "ok    toggle opens a drawer at the top of this tab ($height of $total rows), focus stays put, and its border names the key"
+
+note block --workspace "$w1" "the dock firmware" >/dev/null
+drawer_shows() { hs pane read "$1" --source visible 2>/dev/null | grep -q -- "$2"; }
+wait_for 5 drawer_shows "$d1" "BLOCKER: the dock firmware" || fail "the open drawer doesn't show the blocker: $(hs pane read "$d1" --source visible 2>&1 | head -3)"
+note unblock --workspace "$w1" >/dev/null
+wait_for 5 not drawer_shows "$d1" BLOCKER || fail "the open drawer still shows the blocker after unblock"
+echo "ok    an open drawer shows the blocker at the top as soon as it's set, and drops it on unblock"
+
+hs tab focus "$t2" >/dev/null
+wait_for 10 has_drawer "$t2" "$p3" || fail "visiting tab $t2 while drawers are on didn't open its drawer"
+echo "ok    another tab gets its drawer when you visit it (tab.focused hook)"
+
+d2=$(drawer_of "$t2")
+hs pane close "$d2" >/dev/null
+wait_for 10 no_drawer "$t2" "$p3" 1 || fail "a drawer closed by hand is still listed"
+hs tab focus "$t1" >/dev/null; sleep 1; hs tab focus "$t2" >/dev/null; sleep 2
+no_drawer "$t2" "$p3" 1 || fail "a drawer closed by hand came back on the next visit"
+note drawer toggle >/dev/null   # from tab two, which has no drawer: opens it again
+wait_for 5 has_drawer "$t2" "$p3" || fail "toggle in a tab without a drawer didn't reopen it"
+echo "ok    a drawer closed by hand stays closed on later visits; the toggle key reopens it"
+
+note drawer toggle >/dev/null   # this tab has one: closes them all
+{ wait_for 5 no_drawer "$t1" "$p1" 2 && wait_for 5 no_drawer "$t2" "$p3" 1; } || fail "toggle didn't close every drawer"
+[[ $(tab_panes "$p1") == "$p1 $p2" || $(tab_panes "$p1") == "$p2 $p1" ]] || fail "tab one's panes after closing: $(tab_panes "$p1")"
+hs tab focus "$t1" >/dev/null; sleep 2
+no_drawer "$t1" "$p1" 2 || fail "a drawer came back after the drawers were switched off"
+echo "ok    toggle in a tab with a drawer closes them all, and they stay closed"
+
+# Hooks run a moment late. Switching tabs quickly while the drawers are on leaves the focus where
+# you ended up, never pulled back to a tab you left.
+note drawer close >/dev/null
+hs tab focus "$t1" >/dev/null
+note drawer open >/dev/null
+wait_for 5 has_drawer "$t1" "$p1" || fail "drawer open didn't open one in tab one"
+for _ in 1 2 3; do hs tab focus "$t2" >/dev/null; hs tab focus "$t1" >/dev/null; done
+hs tab focus "$t2" >/dev/null
+sleep 4
+live() { hs api snapshot | jq -r '.result.snapshot | "\(.focused_tab_id) \(.focused_pane_id)"'; }
+read -r ft fp < <(live)
+[[ $ft == "$t2" && $fp == "$p3" ]] || fail "after quick tab switches the focus is on $ft/$fp, not where you ended up ($t2/$p3)"
+echo "ok    quick tab switches with the drawers on leave the focus where you ended up"
+
+# A drawer closed by hand whose pane.closed hook hasn't run yet: the next visit must not reopen it.
+note drawer close >/dev/null
+hs tab focus "$t1" >/dev/null
+note drawer open >/dev/null
+wait_for 5 has_drawer "$t1" "$p1" || fail "drawer open didn't open one"
+echo "w1:pZZZ $t2" >>"$base/$S/drawers"   # listed, gone, its hook not yet run
+hs tab focus "$t2" >/dev/null; sleep 3
+no_drawer "$t2" "$p3" 1 && grep -qx "$t2" "$base/$S/dismissed" ||
+  fail "a vanished drawer whose close hook hadn't run yet was reopened on the next visit"
+echo "ok    a drawer closed by hand stays closed even when its close hook runs late"
+
+# A workspace with no note gets no drawer as you pass through it; the key still opens one there.
+qt=$(hs pane get "$q1" | jq -r '.result.pane.tab_id')
+hs workspace focus "$w2" >/dev/null; sleep 3
+[[ -z $(drawer_of "$qt") ]] || fail "visiting a workspace with no note opened a drawer there"
+note drawer toggle >/dev/null   # this tab has none: opens one, even without a note
+tab_listed() { [[ -n $(drawer_of "$1") ]]; }
+wait_for 5 tab_listed "$qt" || fail "the key in a workspace with no note didn't open its drawer"
+note drawer close >/dev/null
+hs workspace focus "$w1" >/dev/null; hs tab focus "$t1" >/dev/null
+echo "ok    passing through a workspace with no note opens no drawer; the key still does"
+
+# A real pane wrongly listed as a drawer is never closed: drawers close through plugin pane close.
+echo "$p2 $t1" >>"$base/$S/drawers"
+note drawer close >/dev/null
+hs pane get "$p2" >/dev/null 2>&1 || fail "closing the drawers closed a real pane that was wrongly listed as one"
+[[ -z $(drawer_of "$t1") ]] || fail "a real pane wrongly listed as a drawer is still listed after closing the drawers"
+echo "ok    a pane wrongly listed as a drawer survives closing the drawers"
+
+# A restart: herdr forgets titles, the startup hook puts them back, and open drawers come back.
+hs tab focus "$t1" >/dev/null
+note drawer open >/dev/null
+wait_for 5 has_drawer "$t1" "$p1" || fail "drawer open didn't open one"
+stop "$S"
+start "$S"
+wait_for 15 has_title "$p1" "📌 0069 · Short line" || fail "after a restart, the note wasn't put back: '$(title "$p1")'"
+wait_for 15 has_title "$p3" "📌 0069 · Short line" || fail "after a restart, tab two's pane wasn't labeled"
+no_title "$q1" || fail "after a restart, the other workspace got a title"
+hs tab focus "$t1" >/dev/null 2>&1 || true
+wait_for 10 has_drawer "$t1" "$p1" || fail "after a restart, the drawer didn't come back: $(tab_panes "$p1")"
+[[ $(pane_count "$p1") == 3 ]] || fail "after a restart, tab one has a leftover pane: $(tab_panes "$p1")"
+echo "ok    after a restart the notes and the drawer come back, with no leftover drawer panes"
+
+# An update: pause, register again (as installing again does), resume. Drawers are open, and
+# focus changes, a new pane and a new note land during it: nothing reopens or relabels until
+# resume, nothing is orphaned, and resume shows the new note and reopens this tab's drawer.
+pb pause >/dev/null || fail "pause failed"
+[[ $(<"$base/paused") == enabled=true ]] || fail "pause didn't record that the plugin is on: $(cat "$base/paused" 2>/dev/null)"
+no_drawer "$t1" "$p1" 2 || fail "pause didn't close tab one's drawer: $(tab_panes "$p1")"
+[[ -e $base/$S/drawers.on ]] || fail "pause switched the drawers off"
+hs tab focus "$t2" >/dev/null; hs tab focus "$t1" >/dev/null
+p4=$(hs pane split "$p2" --direction down --no-focus | jq -r '.result.pane.pane_id')
+note set --workspace "$w1" "0079 · Set during the pause" >/dev/null
+r=$(note drawer toggle 2>&1) || true
+[[ $r == *paused* ]] || fail "the drawer key during a pause didn't say it's paused: '$r'"
+reregister
+hs tab focus "$t2" >/dev/null; hs tab focus "$t1" >/dev/null; sleep 3
+no_drawer "$t1" "$p1" 3 && no_drawer "$t2" "$p3" 1 || fail "a drawer opened during the pause: $(tab_panes "$p1") / $(tab_panes "$p3")"
+has_title "$p1" "📌 0069 · Short line" && no_title "$p4" || fail "titles changed during the pause: '$(title "$p1")' '$(title "$p4")'"
+pb resume >/dev/null || fail "resume failed"
+[[ ! -e $base/paused && $(enabled) == true ]] || fail "resume left the flag, or the plugin off"
+for p in "$p1" "$p2" "$p3" "$p4"; do
+  wait_for 5 has_title "$p" "📌 0079 · Set during the pause" || fail "after resume, pane $p says '$(title "$p")'"
+done
+wait_for 5 has_drawer "$t1" "$p1" || fail "resume didn't reopen the focused tab's drawer: $(tab_panes "$p1")"
+[[ $(drawer_panes "$S") == "$(listed "$S")" ]] || fail "an update left an orphaned drawer: $(drawer_panes "$S") drawer panes, $(listed "$S") listed"
+hs pane close "$p4" >/dev/null
+echo "ok    pause, register again, resume: nothing reopens or relabels during it, nothing is orphaned, the new note shows after"
+
+# The README's update steps with the plugin switched off: it stays off, and nothing changes.
+note drawer close >/dev/null
+hs plugin disable "$ID" >/dev/null
+pb pause >/dev/null
+[[ $(<"$base/paused") == enabled=false ]] || fail "pause didn't record that the plugin is off"
+reregister
+[[ $(enabled) == true ]] || fail "the test's re-registration didn't switch the plugin on, as installing does"
+p5=$(hs pane split "$p2" --direction down --no-focus | jq -r '.result.pane.pane_id')
+hs tab focus "$t2" >/dev/null; hs tab focus "$t1" >/dev/null
+pb resume >/dev/null
+[[ $(enabled) == false && ! -e $base/paused ]] || fail "after resume the plugin is $(enabled), and the flag is $( [[ -e $base/paused ]] && echo left || echo gone)"
+sleep 2
+no_title "$p5" && no_drawer "$t1" "$p1" 3 || fail "a switched-off plugin changed a title or opened a drawer across the update"
+hs plugin enable "$ID" >/dev/null
+hs pane close "$p5" >/dev/null
+echo "ok    the README's update steps keep a switched-off plugin off, and quiet"
+
+# Run by another plugin's registration (a forwarder, say), it still uses its own id and settings.
+note set --workspace "$w1" "0069 · Short line" >/dev/null
+hs tab focus "$t1" >/dev/null
+r=$("${clean[@]}" HERDR_PLUGIN_ID=other.plugin HERDR_PLUGIN_ROOT="$tmp/elsewhere" HERDR_PLUGIN_CONFIG_DIR="$tmp/elsewhere/cfg" \
+  HERDR_PLUGIN_STATE_DIR="$tmp/elsewhere/state" HERDR_PLUGIN_ACTION_ID=drawer "$root/bin/pinboard" --session "$S" hook 2>&1) ||
+  fail "the drawer action run through another registration failed: $r"
+wait_for 5 has_drawer "$t1" "$p1" || fail "the drawer action run through another registration didn't open this plugin's drawer"
+[[ ! -e $tmp/elsewhere ]] || fail "run through another registration, it used that registration's folders"
+note drawer close >/dev/null
+echo "ok    run through another plugin's registration, it uses its own id, folders and settings"
+
+# Registering the plugin again without a pause orphans an open drawer; closing the drawers still
+# clears it.
+note drawer open >/dev/null
+wait_for 5 has_drawer "$t1" "$p1" || fail "drawer open didn't open one"
+reregister
+note refresh >/dev/null
+note drawer close >/dev/null
+no_drawer_panes() { [[ $(drawer_panes "$1") == 0 ]]; }
+wait_for 5 no_drawer_panes "$S" ||
+  fail "after registering the plugin again, closing the drawers left $(drawer_panes "$S") drawer panes"
+echo "ok    a drawer orphaned by registering the plugin again is still cleared"
+
+# Two sessions with the same workspace ids keep separate notes, and --session ignores the caller's
+# own workspace (which belongs to some other session).
+start "$S2"
+u1=$(hu workspace create --label other-session --focus | jq -r '.result.root_pane.pane_id')
+[[ $(hu pane get "$u1" | jq -r '.result.pane.workspace_id') == "$w1" ]] || fail "the second session's first workspace isn't $w1 too"
+"${clean[@]}" HERDR_WORKSPACE_ID=w999 "$root/bin/pinboard" --session "$S2" set "0002 · In the other session" >/dev/null
+u_title() { [[ $(hu pane get "$1" | jq -r '.result.pane.title // ""') == "$2" ]]; }
+wait_for 5 u_title "$u1" "📌 0002 · In the other session" || fail "--session didn't set the note on that session's focused workspace"
+[[ -s $base/$S2/$w1.line && ! -e $base/$S2/w999.line ]] || fail "--session used the caller's own workspace id"
+has_title "$p1" "📌 0069 · Short line" || fail "a note in the second session changed the first session's pane: '$(title "$p1")'"
+echo "ok    two sessions with the same workspace ids keep separate notes; --session ignores the caller's workspace"
+
+# A session that starts during an update, with drawers saved from before it stopped: herdr brings
+# them back as bare shells, and the start-up step that would close them is skipped while paused.
+# resume runs it: no bare drawer is left, the note is back, and the drawer reopens properly.
+pb --session "$S2" drawer open >/dev/null
+u_drawer() { [[ -n $(awk '{print $1}' "$base/$S2/drawers" 2>/dev/null) ]]; }
+wait_for 5 u_drawer || fail "no drawer opened in the second session"
+stop "$S2"
+pb pause >/dev/null
+start "$S2"
+wait_for 10 test -e "$base/$S2/startup-skipped" || fail "a session started during a pause didn't note its skipped start-up step"
+sleep 1
+[[ $(drawer_panes "$S2") == 1 ]] || fail "the restarted session should hold one bare drawer before resume, it has $(drawer_panes "$S2")"
+pb resume >/dev/null
+wait_for 5 u_title "$u1" "📌 0002 · In the other session" || fail "after resume the restarted session's note isn't back"
+[[ ! -e $base/$S2/startup-skipped ]] || fail "resume didn't run the skipped start-up step"
+wait_for 5 u_drawer || fail "resume didn't reopen the restarted session's drawer"
+[[ $(drawer_panes "$S2") == 1 && $(listed "$S2") == 1 ]] || fail "after resume the restarted session has $(drawer_panes "$S2") drawer panes, $(listed "$S2") listed"
+stop "$S2"
+echo "ok    a session started during a pause gets its start-up step on resume: no bare drawer left behind"
+
+# A closed workspace's note is deleted; other sessions keep their own notes.
+note set --workspace "$w2" "0072 · Other note" >/dev/null
+hs workspace close "$w2" >/dev/null
+wait_for 10 not test -e "$base/$S/$w2.line" || fail "a closed workspace's note file is still there"
+echo "ok    closing a workspace deletes its note (workspace.closed hook)"
+
+note clear --workspace "$w1" >/dev/null
+{ no_title "$p1" && no_title "$p3"; } || fail "clear left a title: '$(title "$p1")' '$(title "$p3")'"
+echo "ok    pinboard clear removes the note from every pane"
+
+# Settings: notes kept in a folder another tool shares, under its lock, and titles reported under
+# its name, so moving over from it copies nothing.
+shared=$tmp/shared
+mkdir -p "$shared/$S"
+printf '%s\n' "# settings" "PINBOARD_STATE_DIR=$shared" 'PINBOARD_TITLE_SOURCE="other-tool"   # its name' \
+  >"$tmp/cfg/herdr/plugins/config/$ID/pinboard.env"
+( exec 9>"$shared/$S/lock"; flock 9; sleep 2 ) &   # the other tool, busy
+sleep 0.3
+t0=$SECONDS
+note set --workspace "$w1" "0079 · In the shared folder" >/dev/null
+(( SECONDS - t0 >= 1 )) || fail "set didn't wait for the shared folder's lock"
+[[ $(<"$shared/$S/$w1.line") == "0079 · In the shared folder" && ! -e $base/$S/$w1.line ]] ||
+  fail "the note didn't go to PINBOARD_STATE_DIR"
+has_title "$p1" "📌 0079 · In the shared folder" || fail "the shared folder's note isn't on the border: '$(title "$p1")'"
+hs pane report-metadata "$p1" --source other-tool --clear-title >/dev/null
+wait_for 5 not has_title "$p1" "📌 0079 · In the shared folder" || fail "the title wasn't reported under PINBOARD_TITLE_SOURCE"
+note refresh >/dev/null
+has_title "$p1" "📌 0079 · In the shared folder" || fail "refresh didn't put the shared folder's note back"
+p6=$(hs pane split "$p2" --direction down --no-focus | jq -r '.result.pane.pane_id')
+wait_for 10 has_title "$p6" "📌 0079 · In the shared folder" || fail "a new pane's hook didn't read the shared folder"
+hs pane close "$p6" >/dev/null
+note clear --workspace "$w1" >/dev/null
+{ no_title "$p1" && no_title "$p3"; } || fail "clear in the shared folder left a title: '$(title "$p1")' '$(title "$p3")'"
+echo "ok    PINBOARD_STATE_DIR and PINBOARD_TITLE_SOURCE: a shared folder under its lock, titles under its name"
+

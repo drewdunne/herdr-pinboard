@@ -1,0 +1,75 @@
+# A pinboard for each herdr workspace: one line on the top border of every pane, and the whole
+# note in a drawer at the top of each tab. bin/pinboard does the work; this tells herdr when to
+# run it. See README.md.
+id = "drewdunne.pinboard"
+name = "Pinboard"
+version = "1.0.0"
+min_herdr_version = "0.9.1"
+description = "A note for each workspace: a line on every pane's top border, and a drawer at the top of each tab"
+platforms = ["linux"]
+
+# herdr forgets pane titles when it restarts: put the notes back.
+[[startup]]
+command = ["bash", "bin/pinboard", "hook"]
+
+# New and moved panes get their workspace's note.
+[[events]]
+on = "pane.created"
+command = ["bash", "bin/pinboard", "hook"]
+
+[[events]]
+on = "pane.moved"
+command = ["bash", "bin/pinboard", "hook"]
+
+# A drawer closed by hand (x or q) keeps that tab's drawer closed until the next toggle.
+[[events]]
+on = "pane.closed"
+command = ["bash", "bin/pinboard", "hook"]
+
+# While the drawers are on, a tab gets its drawer when you visit it.
+[[events]]
+on = "tab.focused"
+command = ["bash", "bin/pinboard", "hook"]
+
+[[events]]
+on = "workspace.focused"
+command = ["bash", "bin/pinboard", "hook"]
+
+[[events]]
+on = "workspace.closed"
+command = ["bash", "bin/pinboard", "hook"]
+
+# Bind keys to these in herdr's config (README.md, "Keys").
+[[actions]]
+id = "drawer"
+title = "Open or close the pinboard drawers"
+contexts = ["workspace", "tab", "pane"]
+command = ["bash", "bin/pinboard", "hook"]
+
+[[actions]]
+id = "whole"
+title = "Show the whole pinboard"
+contexts = ["workspace", "tab", "pane"]
+command = ["bash", "bin/pinboard", "hook"]
+
+[[actions]]
+id = "restore"
+title = "Put every pinboard back"
+command = ["bash", "bin/pinboard", "hook"]
+
+[[panes]]
+id = "drawer"
+title = "Pinboard"
+placement = "split"
+command = ["bash", "bin/pinboard", "view", "drawer"]
+
+# A popup, sized here: an overlay takes the size of the pane it opens over, which right after a
+# drawer opens is sometimes the drawer. herdr 0.9.1's CLI doesn't take --placement popup, so it's
+# set only here.
+[[panes]]
+id = "whole"
+title = "Pinboard"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["bash", "bin/pinboard", "view", "whole"]

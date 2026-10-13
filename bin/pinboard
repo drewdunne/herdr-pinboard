@@ -31,7 +31,7 @@ die() { echo "pinboard: $*" >&2; exit 1; }
 # Who this is: worked out from its own files, never from the registration that ran it, so it
 # behaves the same when another plugin's hook or a link runs it.
 self=$(readlink -f "$0")
-root=$(cd "$(dirname "$self")/.." && pwd)
+root=$(cd -P "$(dirname "$self")/.." && pwd)
 PLUGIN=$(sed -n 's/^id *= *"\([^"]*\)".*/\1/p' "$root/herdr-plugin.toml" 2>/dev/null | head -1)
 [[ -n $PLUGIN ]] || die "no plugin id in $root/herdr-plugin.toml"
 MAX_LINE=76     # herdr keeps a title's first 80 characters; "📌 " and room for "…"
@@ -337,6 +337,15 @@ close_leftover_drawers() {
   done < <(hd api snapshot | jq -r '.result.snapshot.panes[]? | select(.label == "Pinboard") | "\(.pane_id)\t\(.cwd)"')
 }
 
+own_drawer_panes() { # how many drawer panes of this plugin's are open; fails if herdr can't say
+  local snap n=0 dp cwd
+  snap=$(hd api snapshot) || return 1
+  while IFS=$'\t' read -r dp cwd; do
+    [[ -n $dp && $(readlink -f "$cwd") == "$root" ]] && n=$((n + 1))
+  done < <(jq -r '.result.snapshot.panes[]? | select(.label == "Pinboard") | "\(.pane_id)\t\(.cwd)"' <<<"$snap")
+  echo "$n"
+}
+
 drawer() { # drawer open|close|toggle
   prune_drawers
   local tab
@@ -572,17 +581,21 @@ resume() {
   elif [[ $want == true && $now == false ]]; then
     acct plugin enable "$PLUGIN" >/dev/null || die "couldn't switch the plugin on again; it's still paused"
   fi
-  # Each session is put back before the flag goes, so a resume that's stopped partway is finished
-  # by the next one. Then a last relabel, for panes made in between.
-  local running; running=$(herdr_running_sessions)
+  # Each session is put back before the flag goes, so a resume that fails or is stopped partway
+  # keeps the flag, and the next resume finishes it. Then a relabel of every session running by
+  # then, for panes made in between. A session that started during the pause and was missed here
+  # (it restarted meanwhile, or started late) still has its marker, and gets its start-up step at
+  # its next event or refresh.
+  local failed=''
   if [[ $want != false ]]; then
-    for s in $running; do
-      bash "$self" --session "$s" _resume-session || echo "pinboard: couldn't put herdr session $s back" >&2
+    for s in $(herdr_running_sessions); do
+      bash "$self" --session "$s" _resume-session || { echo "pinboard: couldn't put herdr session $s back" >&2; failed=1; }
     done
   fi
+  [[ -z $failed ]] || die "still paused; run pinboard resume again"
   rm -f "$paused_flag"
   if [[ $want == false ]]; then echo "pinboard: resumed (switched off, as before)"; return 0; fi
-  for s in $running; do bash "$self" --session "$s" refresh >/dev/null 2>&1 || true; done
+  for s in $(herdr_running_sessions); do bash "$self" --session "$s" refresh >/dev/null 2>&1 || true; done
   echo "pinboard: resumed"
 }
 
@@ -610,18 +623,29 @@ case $cmd in
   drawer) lock; if may_touch; then drawer "${1:-toggle}"; else paused_note; fi ;;
   whole) lock; if may_touch; then whole; else paused_note; fi ;;
   restore) lock; if may_touch; then restore; else paused_note; fi ;;
-  refresh) lock; if may_touch; then prune_drawers; close_leftover_drawers; relabel; else paused_note; fi ;;
+  refresh)
+    lock
+    if ! may_touch; then paused_note
+    elif [[ -e $skipped ]]; then restore   # this session started during a pause
+    else prune_drawers; close_leftover_drawers; relabel; fi ;;
   pause) pause ;;
   resume) resume ;;
-  _pause-session) lock; override=1; close_drawers; close_leftover_drawers ;;
+  _pause-session) # every drawer of this plugin's closed, or it fails: one left open would be orphaned
+    lock; override=1; close_drawers; close_leftover_drawers
+    [[ ! -s $drawers ]] || die "a drawer in herdr session $key didn't close"
+    [[ $(own_drawer_panes) == 0 ]] || die "a drawer in herdr session $key is still open" ;;
   _resume-session)
     lock; override=1
     if [[ -e $skipped ]]; then restore; else prune_drawers; relabel; ensure_drawer; fi ;;
   hook)
     # Focus changes are frequent; with the drawers off they have nothing to do.
-    [[ ${HERDR_PLUGIN_EVENT:-} == *.focused && ! -e $drawers_on ]] && exit 0
+    [[ ${HERDR_PLUGIN_EVENT:-} == *.focused && ! -e $drawers_on && ! -e $skipped ]] && exit 0
     lock
-    if may_touch; then hook; exit 0; fi
+    if may_touch; then
+      # A start-up step skipped during a pause, and missed by resume, runs at the next event.
+      [[ -e $skipped && ${HERDR_PLUGIN_EVENT:-} != startup ]] && restore
+      hook; exit 0
+    fi
     # Paused: only the bookkeeping that touches no pane.
     case ${HERDR_PLUGIN_EVENT:-} in
       startup) touch "$skipped" ;;

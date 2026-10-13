@@ -368,6 +368,23 @@ wait_for 5 u_drawer || fail "resume didn't reopen the restarted session's drawer
 stop "$S2"
 echo "ok    a session started during a pause gets its start-up step on resume: no bare drawer left behind"
 
+# One that resume missed (it restarted while resume was busy elsewhere, or started late) gets its
+# start-up step at its next event.
+start "$S2"
+wait_for 5 u_drawer || fail "the second session's drawer didn't come back for the next check"
+stop "$S2"
+pb pause >/dev/null
+start "$S2"
+wait_for 10 test -e "$base/$S2/startup-skipped" || fail "the restart during the pause wasn't noted"
+rm -f "$base/paused"   # resume came and went without it
+hu pane split "$u1" --direction right --no-focus >/dev/null   # any event
+wait_for 10 not test -e "$base/$S2/startup-skipped" || fail "the next event didn't run the missed start-up step"
+wait_for 5 u_title "$u1" "📌 0002 · In the other session" || fail "the missed start-up step didn't put the note back"
+wait_for 5 u_drawer && [[ $(drawer_panes "$S2") == 1 && $(listed "$S2") == 1 ]] ||
+  fail "after the missed start-up step: $(drawer_panes "$S2") drawer panes, $(listed "$S2") listed"
+stop "$S2"
+echo "ok    a session resume missed gets its start-up step at its next event"
+
 # A closed workspace's note is deleted; other sessions keep their own notes.
 note set --workspace "$w2" "0072 · Other note" >/dev/null
 hs workspace close "$w2" >/dev/null

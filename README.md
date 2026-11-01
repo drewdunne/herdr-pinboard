@@ -88,8 +88,10 @@ herdr --remote my-server --remote-keybindings server
 | `pinboard show` | Print it (`--workspace ID` too). |
 | `pinboard clear` | Remove it. |
 | `pinboard block "<what's blocking you>"` | Put `BLOCKER: …` at the top of the border and the drawer. `pinboard unblock` takes it off. |
+| `--tab ID` | In place of `--workspace` for `set`, `show`, `clear`, `block` and `unblock`: a note of one tab's own, for a tab that holds other work than the rest of its workspace (say, a second agent on a task of its own). That tab's panes and drawer show it instead of the workspace's, until it's cleared or the tab closes; the other tabs keep the workspace's. |
 | `pinboard drawer [open\|close\|toggle]` | The drawers. `toggle`, the key's action, closes them all if this tab has one, and otherwise opens this tab's, and then each other tab's as you visit it. A drawer you close by hand (`q`) stays closed until the next toggle. |
 | `pinboard whole` | The whole note in a popup over this pane. It scrolls; `q` closes it. `PINBOARD_VIEWER` picks the program it's shown in. |
+| `pinboard supports tabs` | Succeeds where `--tab` is known (1.2.0 on); older versions fail it. For a tool that works with both. |
 | `pinboard check [--hint TEXT]` | For an agent's prompt hook: a reminder to set a note when the workspace has none, and nothing otherwise. `--hint` adds your own conventions. |
 | `pinboard pause`, `pinboard resume` | Around an update; see [Updating](#updating). |
 | `pinboard refresh` | Relabel every pane from the notes, and close drawers that are no longer working. |

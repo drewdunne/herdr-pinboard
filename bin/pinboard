@@ -9,6 +9,11 @@
 #   pinboard show [--workspace ID]   print it
 #   pinboard block [--workspace ID] "<what's blocking you>"
 #                                   put "BLOCKER: …" at the top of the pinboard; unblock removes it
+#   --tab ID, in place of --workspace, gives set, clear, show, block and unblock one tab's own note:
+#   that tab's panes and drawer show it instead of their workspace's, until it's cleared or the tab
+#   closes. For a tab that holds other work than the rest of its workspace.
+#   pinboard supports tabs          succeeds where --tab is known (1.2.0 on), for tools that must
+#                                   work with older versions too, which fail it
 #   pinboard check [--hint TEXT]    for an agent's prompt hook: a reminder if its workspace has no
 #                                   pinboard yet, nothing otherwise
 #   pinboard drawer [open|close|toggle]
@@ -210,22 +215,28 @@ panes() { hd pane list | jq -r '.result.panes[] | "\(.pane_id)\t\(.workspace_id)
 
 is_drawer() { grep -q "^$1 " "$drawers" 2>/dev/null; }
 
-title_for() { # title_for PANE WORKSPACE: the title this pane should have, empty for none
+# Whose note a tab shows: its own, while it has one, else its workspace's.
+note_key() { # note_key WORKSPACE [TAB]
+  if [[ -n ${2:-} && -s $state/$2.line ]]; then echo "$2"; else echo "$1"; fi
+}
+
+title_for() { # title_for PANE WORKSPACE [TAB]: the title this pane should have, empty for none
+  local k; k=$(note_key "$2" "${3:-}")
   if is_drawer "$1"; then
     read_keys
     if [[ -n $drawer_key ]]; then echo "📌 pinboard · $drawer_key closes"
     else echo "📌 pinboard · bind a key to $PLUGIN.drawer to close it"; fi
-  elif [[ -s $state/$2.blocker ]]; then
-    echo "📌 $(shorten "BLOCKER: $(<"$state/$2.blocker") · $(cat "$state/$2.line" 2>/dev/null)")"
-  elif [[ -s $state/$2.line ]]; then
-    echo "📌 $(<"$state/$2.line")"
+  elif [[ -s $state/$k.blocker ]]; then
+    echo "📌 $(shorten "BLOCKER: $(<"$state/$k.blocker") · $(cat "$state/$k.line" 2>/dev/null)")"
+  elif [[ -s $state/$k.line ]]; then
+    echo "📌 $(<"$state/$k.line")"
   fi
 }
 
-label() { # label PANE WORKSPACE CURRENT_TITLE
+label() { # label PANE WORKSPACE CURRENT_TITLE [TAB]
   may_touch || return 0
   local want
-  want=$(title_for "$1" "$2")
+  want=$(title_for "$1" "$2" "${4:-}")
   if [[ -n $want ]]; then
     [[ $want == "$3" ]] || hd pane report-metadata "$1" --source "$SOURCE" --title "$want" >/dev/null 2>&1 || true
   elif [[ $3 == "📌 "* ]]; then
@@ -234,12 +245,13 @@ label() { # label PANE WORKSPACE CURRENT_TITLE
 }
 
 # Work each pane's title out afresh from the files, so it doesn't matter in which order changes land.
-relabel() { # relabel [WORKSPACE]
+relabel() { # relabel [WORKSPACE] [TAB]
   may_touch || return 0
   local pane ws tab title
   while IFS=$'\t' read -r pane ws tab title; do
     [[ -z ${1:-} || $ws == "$1" ]] || continue
-    label "$pane" "$ws" "$title"
+    [[ -z ${2:-} || $tab == "$2" ]] || continue
+    label "$pane" "$ws" "$title" "$tab"
   done < <(panes)
 }
 
@@ -247,7 +259,8 @@ relabel_pane() {
   may_touch || return 0
   local info
   info=$(hd pane get "$1" 2>/dev/null) || return 0
-  label "$1" "$(jq -r '.result.pane.workspace_id' <<<"$info")" "$(jq -r '.result.pane.title // ""' <<<"$info")"
+  label "$1" "$(jq -r '.result.pane.workspace_id' <<<"$info")" "$(jq -r '.result.pane.title // ""' <<<"$info")" \
+    "$(jq -r '.result.pane.tab_id // ""' <<<"$info")"
 }
 
 # Forget drawers herdr no longer has. The pinboard unlists its own drawers before closing them, so
@@ -277,7 +290,7 @@ open_drawer() { # open_drawer [--if-noted]: with --if-noted, only in a workspace
   grep -qx "$tab" "$dismissed" 2>/dev/null && return 0
   read -r any ws < <(panes | awk -F'\t' -v t="$tab" '$3==t{print $1, $2; exit}')
   [[ -n $any ]] || return 0
-  [[ ${1:-} == --if-noted && ! -s $state/$ws.line ]] && return 0
+  [[ ${1:-} == --if-noted && ! -s $state/$ws.line && ! -s $state/$tab.line ]] && return 0
   lay=$(hd pane layout --pane "$any") || return 0
   first=$(jq -r '[.result.layout.panes[]] | sort_by(.rect.y, .rect.x) | .[0].pane_id' <<<"$lay")
   focused=$(jq -r '.result.layout.focused_pane_id // empty' <<<"$lay")
@@ -402,7 +415,11 @@ hook() {
     tab.focused:*|workspace.focused:*) ensure_drawer ;;
     workspace.closed:*)
       local w; w=$(event_field '.data.workspace.workspace_id // .data.workspace_id')
-      [[ -n $w ]] && rm -f "$state/$w.line" "$state/$w.full" "$state/$w.blocker" "$state/$w.view.md" ;;
+      # Its tabs' own notes too: a tab's id starts with its workspace's and a colon.
+      [[ -n $w ]] && rm -f "$state/$w".{line,full,blocker,view.md} "$state/$w":*.{line,full,blocker,view.md} ;;
+    tab.closed:*)
+      local t; t=$(event_field '.data.tab.tab_id // .data.tab_id')
+      [[ -n $t ]] && forget_tab "$t" ;;
     *:drawer) drawer toggle ;;
     *:whole) whole ;;
     *:restore) restore ;;
@@ -434,31 +451,37 @@ note_file() { # the whole note if there is one, else the line; worked out afresh
   if [[ -s $state/$1.full ]]; then echo "$state/$1.full"; else echo "$state/$1.line"; fi
 }
 
+# A tab's own note goes with the tab: once it closes, the note can't come back on a tab given its id.
+forget_tab() { rm -f "$state/$1".{line,full,blocker,view.md}; }
+
 pinboard_text() { # pinboard_text WORKSPACE FILE: the blocker first, if there is one, then the note
   if [[ -s $state/$1.blocker ]]; then printf 'BLOCKER: %s\n\n' "$(<"$state/$1.blocker")"; fi
   cat "$2" 2>/dev/null || true
 }
 
 view() { # view drawer|whole
-  local ws f
+  local ws tab k f
   ws=${HERDR_WORKSPACE_ID:-}
   [[ -n $ws ]] || ws=$(jq -r '.workspace_id // empty' <<<"${HERDR_PLUGIN_CONTEXT_JSON:-{}}" 2>/dev/null || true)
+  tab=${HERDR_TAB_ID:-}
+  [[ -n $tab ]] || tab=$(jq -r '.tab_id // empty' <<<"${HERDR_PLUGIN_CONTEXT_JSON:-{}}" 2>/dev/null || true)
   if [[ $1 == whole ]]; then
-    f=$(note_file "$ws")
+    k=$(note_key "$ws" "$tab")
+    f=$(note_file "$k")
     # A viewer of your own (PINBOARD_VIEWER, say mdroll) gets the note as a file: the blocker
     # first, unless the note already says it, then the note as written.
     local viewer=()
     read -ra viewer <<<"${PINBOARD_VIEWER:-}"
     if (( ${#viewer[@]} )) && command -v "${viewer[0]}" >/dev/null; then
-      local md=$state/$ws.view.md b=''
-      [[ -s $state/$ws.blocker ]] && b=$(<"$state/$ws.blocker")
+      local md=$state/$k.view.md b=''
+      [[ -s $state/$k.blocker ]] && b=$(<"$state/$k.blocker")
       { if [[ -n $b ]] && ! grep -qF -- "$b" "$f" 2>/dev/null; then printf '**BLOCKER:** %s\n\n' "$b"; fi
         cat "$f" 2>/dev/null || true; } >"$md"
       "${viewer[@]}" "$md" || true
       return 0
     fi
     # Otherwise it scrolls in less (arrows, space, b); q closes it.
-    { echo; pinboard_text "$ws" "$f" | wrap_note "$(stty size 2>/dev/null | cut -d' ' -f2 || echo 80)"; } |
+    { echo; pinboard_text "$k" "$f" | wrap_note "$(stty size 2>/dev/null | cut -d' ' -f2 || echo 80)"; } |
       less -R -P "q closes · space scrolls" || true
     return 0
   fi
@@ -471,13 +494,14 @@ view() { # view drawer|whole
   printf '\e[?25l'
   local seen='' now size rows cols k lines
   while :; do
-    f=$(note_file "$ws")
+    k=$(note_key "$ws" "$tab")   # a tab's own note, from the moment it has one
+    f=$(note_file "$k")
     size=$(stty size 2>/dev/null || echo "24 80")
-    now="$size $f $({ stat -c '%i:%s:%.9Y' "$f" "$state/$ws.blocker" 2>/dev/null || true; } | tr '\n' ' ')"
+    now="$size $f $({ stat -c '%i:%s:%.9Y' "$f" "$state/$k.blocker" 2>/dev/null || true; } | tr '\n' ' ')"
     if [[ $now != "$seen" ]]; then
       seen=$now
       rows=${size% *} cols=${size#* }
-      mapfile -t lines < <(pinboard_text "$ws" "$f" | wrap_note "$cols")
+      mapfile -t lines < <(pinboard_text "$k" "$f" | wrap_note "$cols")
       if (( ${#lines[@]} > rows )); then
         lines=("${lines[@]:0:rows-1}" "${hint:0:cols-1}")
       fi
@@ -487,38 +511,63 @@ view() { # view drawer|whole
   done
 }
 
-set_note() {
-  local ws='' full='' if_unset='' line
-  while [[ ${1:-} == --* ]]; do
+# Which note a command works on: --workspace ID, or --tab ID for a tab's own, or this workspace's.
+# Sets key (the note's name in the state folder) and, for a tab, tab; the rest of the arguments are
+# left in args.
+target() { # target COMMAND ARGS...
+  local cmd=$1 ws=''; shift
+  key='' tab='' args=()
+  while (( $# )); do
     case $1 in
-      --workspace) ws=${2:?}; shift 2 ;;
-      --full-file) full=${2:?}; shift 2 ;;
-      --if-unset) if_unset=1; shift ;;
-      *) die "set: unknown option $1" ;;
+      --workspace) ws=${2:?--workspace needs an id}; shift 2 ;;
+      --tab) tab=${2:?--tab needs an id}; shift 2 ;;
+      *) args+=("$1"); shift ;;
     esac
   done
-  [[ $# -ge 1 && -n $1 ]] || die 'usage: pinboard set [--workspace ID] [--full-file FILE] [--if-unset] "<line>"'
-  ws=${ws:-$(this_workspace)}
-  [[ -n $ws ]] || die "not in a herdr workspace; pass --workspace ID"
-  [[ -n $if_unset && -s $state/$ws.line ]] && return 0
-  line=$(shorten "$1")
+  [[ -z $ws || -z $tab ]] || die "$cmd: --workspace or --tab, not both"
+  # A tab's id is its workspace's, a colon, and its own (w1:t2); nothing else is taken for one.
+  [[ -z $tab || $tab =~ ^[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$ ]] || die "$cmd: '$tab' isn't a tab id"
+  if [[ -n $tab ]]; then key=$tab; return 0; fi
+  key=${ws:-$(this_workspace)}
+  [[ -n $key ]] || die "not in a herdr workspace; pass --workspace ID"
+}
+relabel_key() { if [[ -n $tab ]]; then relabel "" "$tab"; else relabel "$key"; fi; }
+# A note is only ever written for a tab that's open, checked under the lock its tab.closed hook takes
+# too: so a tab that closes meanwhile never gets its note back, for a later tab given its id to show.
+tab_open() { [[ -z $tab ]] || hd tab get "$tab" >/dev/null 2>&1 || die "$1: tab $tab isn't open"; }
+
+set_note() {
+  local full='' if_unset='' line rest=()
+  target set "$@"
+  set -- "${args[@]+"${args[@]}"}"
+  while (( $# )); do
+    case $1 in
+      --full-file) full=${2:?}; shift 2 ;;
+      --if-unset) if_unset=1; shift ;;
+      --*) die "set: unknown option $1" ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#rest[@]} -ge 1 && -n ${rest[0]} ]] || die 'usage: pinboard set [--workspace ID | --tab ID] [--full-file FILE] [--if-unset] "<line>"'
+  [[ -n $if_unset && -s $state/$key.line ]] && return 0
+  tab_open set
+  line=$(shorten "${rest[0]}")
   # Written whole and then moved into place, so an open drawer never reads half a note.
-  if [[ -n $full ]]; then cp "$full" "$state/$ws.full.tmp"; else printf '%s\n' "$1" >"$state/$ws.full.tmp"; fi
-  printf '%s\n' "$line" >"$state/$ws.line.tmp"
-  mv "$state/$ws.full.tmp" "$state/$ws.full"
-  mv "$state/$ws.line.tmp" "$state/$ws.line"
-  relabel "$ws"
+  if [[ -n $full ]]; then cp "$full" "$state/$key.full.tmp"; else printf '%s\n' "${rest[0]}" >"$state/$key.full.tmp"; fi
+  printf '%s\n' "$line" >"$state/$key.line.tmp"
+  mv "$state/$key.full.tmp" "$state/$key.full"
+  mv "$state/$key.line.tmp" "$state/$key.line"
+  relabel_key
 }
 
-block() { # block [--workspace ID] "<what's blocking you>"
-  local ws=''
-  [[ ${1:-} == --workspace ]] && { ws=${2:?}; shift 2; }
-  [[ -n ${1:-} ]] || die 'usage: pinboard block [--workspace ID] "<what is blocking you>"'
-  ws=${ws:-$(this_workspace)}
-  [[ -n $ws ]] || die "not in a herdr workspace; pass --workspace ID"
-  printf '%s\n' "$(echo "$*" | tr -s '[:space:]' ' ' | sed 's/ *$//')" >"$state/$ws.blocker.tmp"
-  mv "$state/$ws.blocker.tmp" "$state/$ws.blocker"
-  relabel "$ws"
+block() { # block [--workspace ID | --tab ID] "<what's blocking you>"
+  target block "$@"
+  [[ -n ${args[*]:-} ]] || die 'usage: pinboard block [--workspace ID | --tab ID] "<what is blocking you>"'
+  [[ -z $tab || -s $state/$key.line ]] || die "block: tab $tab has no note of its own; set one first"
+  tab_open block
+  printf '%s\n' "$(echo "${args[*]}" | tr -s '[:space:]' ' ' | sed 's/ *$//')" >"$state/$key.blocker.tmp"
+  mv "$state/$key.blocker.tmp" "$state/$key.blocker"
+  relabel_key
 }
 
 # For an agent's prompt hook: inside a herdr workspace with no pinboard, tell the agent to set one.
@@ -618,20 +667,22 @@ paused_note() { echo "pinboard: paused for an update; try again once it's resume
 case $cmd in
   set) lock; set_note "$@" ;;
   clear)
-    lock
-    [[ ${1:-} == --workspace ]] && ws=${2:?} || ws=$(this_workspace)
-    rm -f "$state/$ws.line" "$state/$ws.full" "$state/$ws.blocker" "$state/$ws.view.md"; relabel "$ws" ;;
+    lock; target clear "$@"
+    rm -f "$state/$key".{line,full,blocker,view.md}; relabel_key ;;
   show)
-    [[ ${1:-} == --workspace ]] && ws=${2:?} || ws=$(this_workspace)
-    [[ -s $state/$ws.line ]] || { echo "workspace $ws has no pinboard"; exit 0; }
-    if [[ -s $state/$ws.blocker ]]; then echo "BLOCKER: $(<"$state/$ws.blocker")"; fi
-    cat "$state/$ws.line" "$state/$ws.full" 2>/dev/null || true ;;
+    target show "$@"
+    if [[ ! -s $state/$key.line ]]; then
+      if [[ -n $tab ]]; then echo "tab $tab has no pinboard of its own"; else echo "workspace $key has no pinboard"; fi
+      exit 0
+    fi
+    if [[ -s $state/$key.blocker ]]; then echo "BLOCKER: $(<"$state/$key.blocker")"; fi
+    cat "$state/$key.line" "$state/$key.full" 2>/dev/null || true ;;
   block) lock; block "$@" ;;
   unblock)
-    lock
-    [[ ${1:-} == --workspace ]] && ws=${2:?} || ws=$(this_workspace)
-    rm -f "$state/$ws.blocker"; relabel "$ws" ;;
+    lock; target unblock "$@"
+    rm -f "$state/$key.blocker"; relabel_key ;;
   check) check "$@" ;;
+  supports) [[ ${1:-} == tabs ]] ;;   # what this version can do, for tools that work with older ones too
   drawer) lock; if may_touch; then drawer "${1:-toggle}"; else paused_note; fi ;;
   whole) lock; if may_touch; then whole; else paused_note; fi ;;
   restore) lock; if may_touch; then restore; else paused_note; fi ;;
@@ -661,7 +712,7 @@ case $cmd in
     # Paused: only the bookkeeping that touches no pane.
     case ${HERDR_PLUGIN_EVENT:-} in
       startup) touch "$skipped" ;;
-      pane.closed|workspace.closed) hook ;;
+      pane.closed|workspace.closed|tab.closed) hook ;;
     esac ;;
   view) view "${1:?view drawer|whole}" ;;
   _keys) read_keys; printf '%s\t%s\n' "$drawer_key" "$whole_key" ;;   # for the tests

@@ -3,9 +3,9 @@
 # run it. See README.md.
 id = "drewdunne.pinboard"
 name = "Pinboard"
-version = "1.1.0"
+version = "1.2.0"
 min_herdr_version = "0.9.1"
-description = "A note for each workspace: a line on every pane's top border, and a drawer at the top of each tab"
+description = "A note for each workspace, or for one tab of it: a line on every pane's top border, and a drawer at the top of each tab"
 platforms = ["linux"]
 
 # herdr forgets pane titles when it restarts: put the notes back.
@@ -37,6 +37,11 @@ command = ["bash", "bin/pinboard", "hook"]
 
 [[events]]
 on = "workspace.closed"
+command = ["bash", "bin/pinboard", "hook"]
+
+# A tab's own note goes when the tab does.
+[[events]]
+on = "tab.closed"
 command = ["bash", "bin/pinboard", "hook"]
 
 # Bind keys to these in herdr's config (README.md, "Keys").
